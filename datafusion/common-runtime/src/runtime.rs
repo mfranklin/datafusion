@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use tokio::runtime::{Handle, TryCurrentError};
+use tokio::runtime::{Handle, RuntimeFlavor, TryCurrentError};
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -71,6 +71,13 @@ impl RuntimeHandle {
             .map_err(TryCurrentRuntimeError::from_tokio)
     }
 
+    /// Returns whether this handle is backed by a multi-threaded runtime.
+    ///
+    /// This reflects DataFusion's current Tokio-backed runtime implementation.
+    pub fn is_multi_thread(&self) -> bool {
+        self.inner.runtime_flavor() == RuntimeFlavor::MultiThread
+    }
+
     /// Creates a DataFusion runtime handle from a Tokio runtime handle.
     pub fn from_tokio(handle: Handle) -> Self {
         Self { inner: handle }
@@ -78,5 +85,27 @@ impl RuntimeHandle {
 
     pub(crate) fn as_tokio(&self) -> &Handle {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeHandle;
+    use tokio::runtime::Builder;
+
+    #[test]
+    fn is_multi_thread_returns_false_for_current_thread_runtime() {
+        let runtime = Builder::new_current_thread().build().unwrap();
+        let handle = RuntimeHandle::from_tokio(runtime.handle().clone());
+
+        assert!(!handle.is_multi_thread());
+    }
+
+    #[test]
+    fn is_multi_thread_returns_true_for_multi_thread_runtime() {
+        let runtime = Builder::new_multi_thread().build().unwrap();
+        let handle = RuntimeHandle::from_tokio(runtime.handle().clone());
+
+        assert!(handle.is_multi_thread());
     }
 }

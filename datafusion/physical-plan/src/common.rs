@@ -32,6 +32,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::stats::Precision;
 use datafusion_common::{Result, plan_err};
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::memory_pool::MemoryReservation;
 
 use futures::{StreamExt, TryStreamExt};
@@ -186,11 +187,9 @@ pub fn spawn_buffered(
     mut input: SendableRecordBatchStream,
     buffer: usize,
 ) -> SendableRecordBatchStream {
-    // Use tokio only if running from a multi-thread tokio context
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
+    // Buffer only when running from a multi-thread runtime context.
+    match RuntimeHandle::try_current() {
+        Ok(handle) if handle.is_multi_thread() => {
             let mut builder = RecordBatchReceiverStream::builder(input.schema(), buffer);
 
             let sender = builder.tx();
