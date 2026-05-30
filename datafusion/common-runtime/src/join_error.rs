@@ -19,6 +19,8 @@ use std::any::Any;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use crate::join_set::TaskId;
+
 /// Error returned when joining a spawned task fails.
 ///
 /// This keeps Tokio's join error out of DataFusion's public runtime APIs while
@@ -41,6 +43,11 @@ impl JoinError {
     /// Returns true if the task panicked.
     pub fn is_panic(&self) -> bool {
         self.inner.is_panic()
+    }
+
+    /// Returns an opaque identifier for the task that failed to join.
+    pub fn id(&self) -> TaskId {
+        TaskId::from_tokio(self.inner.id())
     }
 
     /// Consumes the error and returns the panic payload.

@@ -32,7 +32,7 @@ mod trace_utils;
 
 pub use common::SpawnedTask;
 pub use join_error::JoinError;
-pub use join_set::JoinSet;
+pub use join_set::{JoinSet, TaskHandle, TaskId};
 pub use trace_utils::{
     JoinSetTracer, JoinSetTracerError, set_join_set_tracer, trace_block, trace_future,
 };
