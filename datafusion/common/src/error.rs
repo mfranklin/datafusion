@@ -53,8 +53,6 @@ use arrow::error::ArrowError;
 use parquet::errors::ParquetError;
 #[cfg(feature = "sql")]
 use sqlparser::parser::ParserError;
-use tokio::task::JoinError;
-
 /// Result type for operations that could result in an [DataFusionError]
 pub type Result<T, E = DataFusionError> = result::Result<T, E>;
 
@@ -130,10 +128,10 @@ pub enum DataFusionError {
     /// SQL method, opened a CSV file that is broken, or tried to divide an
     /// integer by zero.
     Execution(String),
-    /// [`JoinError`] during execution of the query.
+    /// Error joining a spawned task during execution of the query.
     ///
     /// This error can't occur for unjoined tasks, such as execution shutdown.
-    ExecutionJoin(Box<JoinError>),
+    ExecutionJoin(GenericError),
     /// Error when resources (such as memory of scratch disk space) are exhausted.
     ///
     /// This error is thrown when a consumer cannot acquire additional memory

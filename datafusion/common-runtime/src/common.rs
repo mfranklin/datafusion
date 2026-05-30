@@ -21,8 +21,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinHandle;
 
+use crate::join_error::JoinError;
 use crate::trace_utils::{trace_block, trace_future};
 
 /// Helper that  provides a simple API to spawn a single task and join it.
@@ -101,7 +102,9 @@ impl<R> Future for SpawnedTask<R> {
     type Output = Result<R, JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        Pin::new(&mut self.inner)
+            .poll(cx)
+            .map_err(JoinError::from_tokio)
     }
 }
 

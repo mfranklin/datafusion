@@ -26,10 +26,12 @@
 #![deny(clippy::clone_on_ref_ptr)]
 
 pub mod common;
+mod join_error;
 mod join_set;
 mod trace_utils;
 
 pub use common::SpawnedTask;
+pub use join_error::JoinError;
 pub use join_set::JoinSet;
 pub use trace_utils::{
     JoinSetTracer, JoinSetTracerError, set_join_set_tracer, trace_block, trace_future,

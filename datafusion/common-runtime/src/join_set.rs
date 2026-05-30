@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::join_error::JoinError;
 use crate::trace_utils::{trace_block, trace_future};
 use std::future::Future;
 use std::task::{Context, Poll};
 use tokio::runtime::Handle;
-use tokio::task::{AbortHandle, Id, JoinError, LocalSet};
+use tokio::task::{AbortHandle, Id, LocalSet};
 
 /// A wrapper around Tokio's JoinSet that forwards all API calls while optionally
 /// instrumenting spawned tasks and blocking closures with custom tracing behavior.
@@ -116,12 +117,17 @@ impl<T: 'static> JoinSet<T> {
 
     /// [JoinSet::join_next](tokio::task::JoinSet::join_next) - Await the next completed task.
     pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
-        self.inner.join_next().await
+        self.inner
+            .join_next()
+            .await
+            .map(|result| result.map_err(JoinError::from_tokio))
     }
 
     /// [JoinSet::try_join_next](tokio::task::JoinSet::try_join_next) - Try to join the next completed task.
     pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
-        self.inner.try_join_next()
+        self.inner
+            .try_join_next()
+            .map(|result| result.map_err(JoinError::from_tokio))
     }
 
     /// [JoinSet::abort_all](tokio::task::JoinSet::abort_all) - Abort all tasks.
@@ -139,17 +145,29 @@ impl<T: 'static> JoinSet<T> {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<T, JoinError>>> {
-        self.inner.poll_join_next(cx)
+        match self.inner.poll_join_next(cx) {
+            Poll::Ready(Some(Ok(value))) => Poll::Ready(Some(Ok(value))),
+            Poll::Ready(Some(Err(error))) => {
+                Poll::Ready(Some(Err(JoinError::from_tokio(error))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// [JoinSet::join_next_with_id](tokio::task::JoinSet::join_next_with_id) - Await the next completed task with its ID.
     pub async fn join_next_with_id(&mut self) -> Option<Result<(Id, T), JoinError>> {
-        self.inner.join_next_with_id().await
+        self.inner
+            .join_next_with_id()
+            .await
+            .map(|result| result.map_err(JoinError::from_tokio))
     }
 
     /// [JoinSet::try_join_next_with_id](tokio::task::JoinSet::try_join_next_with_id) - Try to join the next completed task with its ID.
     pub fn try_join_next_with_id(&mut self) -> Option<Result<(Id, T), JoinError>> {
-        self.inner.try_join_next_with_id()
+        self.inner
+            .try_join_next_with_id()
+            .map(|result| result.map_err(JoinError::from_tokio))
     }
 
     /// [JoinSet::poll_join_next_with_id](tokio::task::JoinSet::poll_join_next_with_id) - Poll for the next completed task with its ID.
@@ -157,7 +175,14 @@ impl<T: 'static> JoinSet<T> {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Id, T), JoinError>>> {
-        self.inner.poll_join_next_with_id(cx)
+        match self.inner.poll_join_next_with_id(cx) {
+            Poll::Ready(Some(Ok(value))) => Poll::Ready(Some(Ok(value))),
+            Poll::Ready(Some(Err(error))) => {
+                Poll::Ready(Some(Err(JoinError::from_tokio(error))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// [JoinSet::shutdown](tokio::task::JoinSet::shutdown) - Abort all tasks and wait for shutdown.
