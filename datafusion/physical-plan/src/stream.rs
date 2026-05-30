@@ -84,7 +84,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
-        self.join_set.spawn(task);
+        self.join_set.spawn_task(task);
     }
 
     /// Same as [`Self::spawn`] but it spawns the task on the provided runtime
@@ -93,7 +93,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
-        self.join_set.spawn_on(task, handle);
+        self.join_set.spawn_task_on(task, handle);
     }
 
     /// Spawn a blocking task that will be aborted if this builder (or the stream
@@ -106,7 +106,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking(f);
+        self.join_set.spawn_blocking_task(f);
     }
 
     /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided runtime
@@ -115,7 +115,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking_on(f, handle);
+        self.join_set.spawn_blocking_task_on(f, handle);
     }
 
     /// Create a stream of all data written to `tx`

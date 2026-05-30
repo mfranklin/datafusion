@@ -1301,7 +1301,7 @@ pub async fn collect_partitioned(
     let mut join_set = JoinSet::new();
     // Execute the plan and collect the results into batches.
     streams.into_iter().enumerate().for_each(|(idx, stream)| {
-        join_set.spawn(async move {
+        join_set.spawn_task(async move {
             let result: Result<Vec<RecordBatch>> = stream.try_collect().await;
             (idx, result)
         });
