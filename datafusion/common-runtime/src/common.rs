@@ -24,6 +24,7 @@ use std::{
 use tokio::task::JoinHandle;
 
 use crate::join_error::JoinError;
+use crate::runtime::RuntimeHandle;
 use crate::trace_utils::{trace_block, trace_future};
 
 /// Helper that  provides a simple API to spawn a single task and join it.
@@ -59,6 +60,31 @@ impl<R: 'static> SpawnedTask<R> {
         // Ok to use spawn_blocking here as SpawnedTask handles aborting/cancelling the task on Drop
         #[expect(clippy::disallowed_methods)]
         let inner = tokio::task::spawn_blocking(trace_block(task));
+        Self { inner }
+    }
+
+    /// Spawn a task on a provided DataFusion runtime handle.
+    pub fn spawn_on_runtime<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send,
+    {
+        let inner = handle.as_tokio().spawn(trace_future(task));
+        Self { inner }
+    }
+
+    /// Spawn a blocking task on a provided DataFusion runtime handle.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    pub fn spawn_blocking_on_runtime<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send,
+    {
+        let inner = handle.as_tokio().spawn_blocking(trace_block(task));
         Self { inner }
     }
 
@@ -188,5 +214,25 @@ mod tests {
 
         // The sender was dropped so we receive `None`.
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[test]
+    fn spawn_on_runtime_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = SpawnedTask::spawn_on_runtime(async { 42 }, &handle);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn spawn_blocking_on_runtime_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = SpawnedTask::spawn_blocking_on_runtime(|| 42, &handle);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
     }
 }
