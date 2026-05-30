@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::join_error::JoinError;
+use crate::runtime::RuntimeHandle;
 use crate::trace_utils::{trace_block, trace_future};
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
@@ -158,6 +159,20 @@ impl<T: 'static> JoinSet<T> {
         TaskHandle::from_tokio(self.spawn_on(task, handle))
     }
 
+    /// Spawn a task on a provided runtime and return a runtime-neutral handle to it.
+    pub fn spawn_task_on_runtime<F>(
+        &mut self,
+        task: F,
+        handle: &RuntimeHandle,
+    ) -> TaskHandle
+    where
+        F: Future<Output = T>,
+        F: Send + 'static,
+        T: Send,
+    {
+        TaskHandle::from_tokio(self.spawn_on(task, handle.as_tokio()))
+    }
+
     /// [JoinSet::spawn_local](tokio::task::JoinSet::spawn_local) - Spawn a local task.
     pub fn spawn_local<F>(&mut self, task: F) -> AbortHandle
     where
@@ -238,6 +253,23 @@ impl<T: 'static> JoinSet<T> {
         T: Send,
     {
         TaskHandle::from_tokio(self.spawn_blocking_on(f, handle))
+    }
+
+    /// Spawn a blocking task on a provided runtime and return a runtime-neutral handle to it.
+    ///
+    /// Aborting the returned handle may only prevent the task from starting. Once
+    /// the blocking task is running, it may continue to run to completion.
+    pub fn spawn_blocking_task_on_runtime<F>(
+        &mut self,
+        f: F,
+        handle: &RuntimeHandle,
+    ) -> TaskHandle
+    where
+        F: FnOnce() -> T,
+        F: Send + 'static,
+        T: Send,
+    {
+        TaskHandle::from_tokio(self.spawn_blocking_on(f, handle.as_tokio()))
     }
 
     /// [JoinSet::join_next](tokio::task::JoinSet::join_next) - Await the next completed task.
@@ -413,6 +445,30 @@ mod tests {
     async fn join_next_with_task_id_returns_runtime_neutral_id() {
         let mut join_set = JoinSet::new();
         let handle = join_set.spawn_task(async { 42 });
+        let expected_id = handle.id();
+
+        let (task_id, value) = join_set.join_next_with_task_id().await.unwrap().unwrap();
+        assert_eq!(task_id, expected_id);
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn spawn_task_on_runtime_uses_runtime_handle() {
+        let runtime = RuntimeHandle::current();
+        let mut join_set = JoinSet::new();
+        let handle = join_set.spawn_task_on_runtime(async { 42 }, &runtime);
+        let expected_id = handle.id();
+
+        let (task_id, value) = join_set.join_next_with_task_id().await.unwrap().unwrap();
+        assert_eq!(task_id, expected_id);
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_task_on_runtime_uses_runtime_handle() {
+        let runtime = RuntimeHandle::current();
+        let mut join_set = JoinSet::new();
+        let handle = join_set.spawn_blocking_task_on_runtime(|| 42, &runtime);
         let expected_id = handle.id();
 
         let (task_id, value) = join_set.join_next_with_task_id().await.unwrap().unwrap();
