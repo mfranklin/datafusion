@@ -1397,7 +1397,6 @@ mod tests {
         buffer::NullBuffer,
         datatypes::Int32Type,
     };
-    use sqlparser::ast::Ident;
 
     #[test]
     fn test_bisect_linear_left_and_right() -> Result<()> {

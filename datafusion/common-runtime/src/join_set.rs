@@ -24,7 +24,11 @@ use std::task::{Context, Poll};
 use tokio::runtime::Handle;
 use tokio::task::{AbortHandle, Id, LocalSet};
 
-/// An opaque identifier for a spawned task.
+/// An opaque identifier for a DataFusion-spawned Tokio task.
+///
+/// This is a DataFusion-owned compatibility wrapper for IDs returned by
+/// Tokio-backed task APIs today, including Tokio local tasks. Non-Tokio local
+/// or thread-affine runtimes will need separate task identity abstractions.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct TaskId {
     inner: Id,
@@ -42,8 +46,13 @@ impl Display for TaskId {
     }
 }
 
-/// An owned permission to request cancellation of a spawned task, without
-/// awaiting its completion.
+/// An owned permission to request cancellation of a DataFusion-spawned Tokio
+/// task, without awaiting its completion.
+///
+/// This is a DataFusion-owned compatibility wrapper for Tokio-backed task APIs
+/// today, including Tokio local tasks. It should not be treated as a general
+/// handle for non-Tokio local or thread-affine runtimes such as monoio or
+/// glommio.
 ///
 /// For blocking tasks, aborting may only prevent the task from starting. Once a
 /// blocking task is running, it may continue to run to completion.
@@ -129,7 +138,7 @@ impl<T: 'static> JoinSet<T> {
         self.inner.spawn(trace_future(task))
     }
 
-    /// Spawn a new task and return a runtime-neutral handle to it.
+    /// Spawn a new task and return a DataFusion task handle.
     pub fn spawn_task<F>(&mut self, task: F) -> TaskHandle
     where
         F: Future<Output = T>,
@@ -149,7 +158,7 @@ impl<T: 'static> JoinSet<T> {
         self.inner.spawn_on(trace_future(task), handle)
     }
 
-    /// Spawn a task on a provided runtime and return a runtime-neutral handle to it.
+    /// Spawn a task on a provided runtime and return a DataFusion task handle.
     pub fn spawn_task_on<F>(&mut self, task: F, handle: &Handle) -> TaskHandle
     where
         F: Future<Output = T>,
@@ -159,7 +168,7 @@ impl<T: 'static> JoinSet<T> {
         TaskHandle::from_tokio(self.spawn_on(task, handle))
     }
 
-    /// Spawn a task on a provided runtime and return a runtime-neutral handle to it.
+    /// Spawn a task on a provided runtime and return a DataFusion task handle.
     pub fn spawn_task_on_runtime<F>(
         &mut self,
         task: F,
@@ -182,7 +191,7 @@ impl<T: 'static> JoinSet<T> {
         self.inner.spawn_local(task)
     }
 
-    /// Spawn a new local task and return a runtime-neutral handle to it.
+    /// Spawn a new local task and return a DataFusion task handle.
     pub fn spawn_local_task<F>(&mut self, task: F) -> TaskHandle
     where
         F: Future<Output = T>,
@@ -200,7 +209,7 @@ impl<T: 'static> JoinSet<T> {
         self.inner.spawn_local_on(task, local_set)
     }
 
-    /// Spawn a local task on a provided LocalSet and return a runtime-neutral handle to it.
+    /// Spawn a local task on a provided LocalSet and return a DataFusion task handle.
     pub fn spawn_local_task_on<F>(&mut self, task: F, local_set: &LocalSet) -> TaskHandle
     where
         F: Future<Output = T>,
@@ -219,7 +228,7 @@ impl<T: 'static> JoinSet<T> {
         self.inner.spawn_blocking(trace_block(f))
     }
 
-    /// Spawn a blocking task and return a runtime-neutral handle to it.
+    /// Spawn a blocking task and return a DataFusion task handle.
     ///
     /// Aborting the returned handle may only prevent the task from starting. Once
     /// the blocking task is running, it may continue to run to completion.
@@ -242,7 +251,7 @@ impl<T: 'static> JoinSet<T> {
         self.inner.spawn_blocking_on(trace_block(f), handle)
     }
 
-    /// Spawn a blocking task on a provided runtime and return a runtime-neutral handle to it.
+    /// Spawn a blocking task on a provided runtime and return a DataFusion task handle.
     ///
     /// Aborting the returned handle may only prevent the task from starting. Once
     /// the blocking task is running, it may continue to run to completion.
@@ -255,7 +264,7 @@ impl<T: 'static> JoinSet<T> {
         TaskHandle::from_tokio(self.spawn_blocking_on(f, handle))
     }
 
-    /// Spawn a blocking task on a provided runtime and return a runtime-neutral handle to it.
+    /// Spawn a blocking task on a provided runtime and return a DataFusion task handle.
     ///
     /// Aborting the returned handle may only prevent the task from starting. Once
     /// the blocking task is running, it may continue to run to completion.
@@ -320,7 +329,7 @@ impl<T: 'static> JoinSet<T> {
             .map(|result| result.map_err(JoinError::from_tokio))
     }
 
-    /// Await the next completed task with its runtime-neutral ID.
+    /// Await the next completed task with its DataFusion task ID.
     pub async fn join_next_with_task_id(
         &mut self,
     ) -> Option<Result<(TaskId, T), JoinError>> {
@@ -338,7 +347,7 @@ impl<T: 'static> JoinSet<T> {
             .map(|result| result.map_err(JoinError::from_tokio))
     }
 
-    /// Try to join the next completed task with its runtime-neutral ID.
+    /// Try to join the next completed task with its DataFusion task ID.
     pub fn try_join_next_with_task_id(
         &mut self,
     ) -> Option<Result<(TaskId, T), JoinError>> {
@@ -364,7 +373,7 @@ impl<T: 'static> JoinSet<T> {
         }
     }
 
-    /// Poll for the next completed task with its runtime-neutral ID.
+    /// Poll for the next completed task with its DataFusion task ID.
     pub fn poll_join_next_with_task_id(
         &mut self,
         cx: &mut Context<'_>,

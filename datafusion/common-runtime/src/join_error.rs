@@ -21,10 +21,13 @@ use std::fmt::{Display, Formatter};
 
 use crate::join_set::TaskId;
 
-/// Error returned when joining a spawned task fails.
+/// Error returned when joining a DataFusion-spawned Tokio task fails.
 ///
-/// This keeps Tokio's join error out of DataFusion's public runtime APIs while
-/// preserving the cancellation and panic inspection methods callers use today.
+/// This DataFusion-owned compatibility wrapper keeps Tokio's join error out of
+/// DataFusion's public runtime APIs while preserving the cancellation and panic
+/// inspection methods callers use today. It represents join failures for
+/// Tokio-backed task APIs, including Tokio local tasks; non-Tokio local or
+/// thread-affine runtimes will need separate abstractions.
 #[derive(Debug)]
 pub struct JoinError {
     inner: tokio::task::JoinError,

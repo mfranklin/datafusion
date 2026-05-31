@@ -388,7 +388,7 @@ impl FileSink for ParquetSink {
         demux_task
             .join_unwind()
             .await
-            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+            .map_err(DataFusionError::execution_join)??;
 
         Ok(rows_written_counter.value() as u64)
     }
@@ -534,7 +534,7 @@ fn spawn_rg_join_and_finalize_task(
             let (writer, _col_reservation) = task
                 .join_unwind()
                 .await
-                .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+                .map_err(DataFusionError::execution_join)??;
             let encoded_size = writer.get_estimated_total_bytes();
             rg_reservation.grow(encoded_size);
             let _timer = encoding_time.timer();
@@ -672,7 +672,7 @@ async fn concatenate_parallel_row_groups(
     while let Some(task) = serialize_rx.recv().await {
         let result = task.join_unwind().await;
         let (serialized_columns, rg_reservation, _cnt) =
-            result.map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+            result.map_err(DataFusionError::execution_join)??;
 
         let mut rg_out = parquet_writer.next_row_group()?;
         for chunk in serialized_columns {
@@ -749,6 +749,6 @@ async fn output_single_parquet_file_parallelized(
     launch_serialization_task
         .join_unwind()
         .await
-        .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+        .map_err(DataFusionError::execution_join)??;
     Ok(parquet_meta_data)
 }

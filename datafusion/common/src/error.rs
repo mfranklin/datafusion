@@ -128,9 +128,15 @@ pub enum DataFusionError {
     /// SQL method, opened a CSV file that is broken, or tried to divide an
     /// integer by zero.
     Execution(String),
-    /// Error joining a spawned task during execution of the query.
+    /// Error joining a DataFusion-spawned task during query execution.
     ///
-    /// This error can't occur for unjoined tasks, such as execution shutdown.
+    /// This variant is reserved for task join failures, such as cancellation,
+    /// observed while awaiting a spawned task. It is intentionally stored as a
+    /// generic error so `datafusion-common` does not expose Tokio types in its
+    /// public API. Use [`DataFusionError::execution_join`] to construct it.
+    ///
+    /// This error can't occur for unjoined tasks, such as execution shutdown,
+    /// and should not be used for arbitrary execution-time errors.
     ExecutionJoin(GenericError),
     /// Error when resources (such as memory of scratch disk space) are exhausted.
     ///
@@ -415,6 +421,19 @@ impl From<DataFusionError> for io::Error {
 impl DataFusionError {
     /// The separator between the error message and the backtrace
     pub const BACK_TRACE_SEP: &'static str = "\n\nbacktrace: ";
+
+    /// Creates an error for a failed join of a DataFusion-spawned task.
+    ///
+    /// This helper centralizes the [`DataFusionError::ExecutionJoin`] invariant:
+    /// callers should use it only for errors returned while awaiting spawned
+    /// task handles. The boxed error keeps Tokio-specific join error types out
+    /// of `datafusion-common`'s public API.
+    pub fn execution_join<E>(error: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        DataFusionError::ExecutionJoin(Box::new(error))
+    }
 
     /// Get deepest underlying [`DataFusionError`]
     ///

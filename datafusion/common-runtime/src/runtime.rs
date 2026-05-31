@@ -44,11 +44,13 @@ impl Error for TryCurrentRuntimeError {
     }
 }
 
-/// An owned handle to an async runtime used by DataFusion runtime utilities.
+/// An owned handle to a Tokio runtime used by DataFusion runtime utilities.
 ///
-/// This type keeps new DataFusion APIs from requiring callers to pass Tokio's
-/// runtime handle directly. Existing APIs that accept [`Handle`] remain
-/// available for compatibility.
+/// This DataFusion-owned compatibility wrapper keeps new cross-thread `Send`
+/// task APIs from requiring callers to pass Tokio's runtime handle directly.
+/// It is Tokio-backed today; local or thread-affine runtimes such as monoio or
+/// glommio require separate abstractions rather than this handle. Existing APIs
+/// that accept [`Handle`] remain available for compatibility.
 #[derive(Clone, Debug)]
 pub struct RuntimeHandle {
     inner: Handle,
