@@ -27,6 +27,58 @@ use crate::join_error::JoinError;
 use crate::runtime::RuntimeHandle;
 use crate::trace_utils::{trace_block, trace_future};
 
+mod private {
+    pub trait Sealed {}
+}
+
+/// DataFusion-owned compatibility abstraction for spawning a single task.
+///
+/// This trait is backed by Tokio today and preserves DataFusion's existing
+/// `Send + 'static` single-task spawning semantics by returning [`SpawnedTask`].
+/// It is DataFusion-owned and is not currently an external executor plugin
+/// point. Its generic methods mean it is not a `dyn Executor` abstraction yet.
+/// Runtimes that support `!Send` local tasks need separate abstractions.
+pub trait TaskSpawner: private::Sealed {
+    /// Spawn an asynchronous task.
+    fn spawn<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static;
+
+    /// Spawn a blocking task.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    fn spawn_blocking<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static;
+}
+
+impl private::Sealed for RuntimeHandle {}
+
+impl TaskSpawner for RuntimeHandle {
+    fn spawn<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        SpawnedTask::spawn_on_runtime(task, self)
+    }
+
+    fn spawn_blocking<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        SpawnedTask::spawn_blocking_on_runtime(task, self)
+    }
+}
+
 /// Helper that  provides a simple API to spawn a single task and join it.
 /// Provides guarantees of aborting on `Drop` to keep it cancel-safe.
 /// Note that if the task was spawned with `spawn_blocking`, it will only be
@@ -232,6 +284,26 @@ mod tests {
         let handle = RuntimeHandle::from_tokio(rt.handle().clone());
 
         let task = SpawnedTask::spawn_blocking_on_runtime(|| 42, &handle);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn task_spawner_spawn_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = TaskSpawner::spawn(&handle, async { 42 });
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn task_spawner_spawn_blocking_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = TaskSpawner::spawn_blocking(&handle, || 42);
 
         assert_eq!(rt.block_on(task.join()).unwrap(), 42);
     }
