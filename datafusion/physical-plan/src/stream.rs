@@ -96,17 +96,8 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         self.join_set.spawn_task_on(task, handle);
     }
 
-    /// Same as [`Self::spawn`] but it spawns the task on the provided DataFusion runtime handle.
-    pub fn spawn_on_runtime<F>(&mut self, task: F, handle: &RuntimeHandle)
-    where
-        F: Future<Output = Result<()>>,
-        F: Send + 'static,
-    {
-        self.spawn_with(task, handle);
-    }
-
     /// Same as [`Self::spawn`] but it spawns the task using the provided spawner.
-    pub fn spawn_with<F, S>(&mut self, task: F, spawner: &S)
+    pub(crate) fn spawn_with<F, S>(&mut self, task: F, spawner: &S)
     where
         F: Future<Output = Result<()>>,
         F: Send + 'static,
@@ -140,21 +131,12 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         self.join_set.spawn_blocking_task_on(f, handle);
     }
 
-    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided DataFusion runtime handle.
-    pub fn spawn_blocking_on_runtime<F>(&mut self, f: F, handle: &RuntimeHandle)
-    where
-        F: FnOnce() -> Result<()>,
-        F: Send + 'static,
-    {
-        self.spawn_blocking_with(f, handle);
-    }
-
     /// Same as [`Self::spawn_blocking`] but it spawns the blocking task using
     /// the provided spawner.
     ///
     /// Aborting the task may only prevent it from starting. Once the blocking
     /// task is running, it may continue to run to completion.
-    pub fn spawn_blocking_with<F, S>(&mut self, f: F, spawner: &S)
+    pub(crate) fn spawn_blocking_with<F, S>(&mut self, f: F, spawner: &S)
     where
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
@@ -333,11 +315,11 @@ impl RecordBatchReceiverStreamBuilder {
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
-        self.inner.spawn_on_runtime(task, handle)
+        self.spawn_with(task, handle)
     }
 
     /// Same as [`Self::spawn`] but it spawns the task using the provided spawner.
-    pub fn spawn_with<F, S>(&mut self, task: F, spawner: &S)
+    pub(crate) fn spawn_with<F, S>(&mut self, task: F, spawner: &S)
     where
         F: Future<Output = Result<()>>,
         F: Send + 'static,
@@ -388,7 +370,7 @@ impl RecordBatchReceiverStreamBuilder {
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
-        self.inner.spawn_blocking_on_runtime(f, handle)
+        self.spawn_blocking_with(f, handle)
     }
 
     /// Same as [`Self::spawn_blocking`] but it spawns the blocking task using
@@ -396,7 +378,7 @@ impl RecordBatchReceiverStreamBuilder {
     ///
     /// Aborting the task may only prevent it from starting. Once the blocking
     /// task is running, it may continue to run to completion.
-    pub fn spawn_blocking_with<F, S>(&mut self, f: F, spawner: &S)
+    pub(crate) fn spawn_blocking_with<F, S>(&mut self, f: F, spawner: &S)
     where
         F: FnOnce() -> Result<()>,
         F: Send + 'static,

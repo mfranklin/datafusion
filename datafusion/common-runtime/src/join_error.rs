@@ -76,6 +76,27 @@ impl Display for JoinError {
 
 impl Error for JoinError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.inner)
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::future::pending;
+
+    #[tokio::test]
+    async fn source_does_not_expose_tokio_join_error() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test needs a raw Tokio JoinError to verify it is not exposed"
+        )]
+        let handle = tokio::spawn(pending::<()>());
+        handle.abort();
+
+        let error = JoinError::from_tokio(handle.await.unwrap_err());
+        assert!(error.is_cancelled());
+        assert!(error.source().is_none());
     }
 }
