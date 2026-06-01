@@ -24,9 +24,9 @@ use crate::join_set::TaskId;
 /// Error returned when joining a DataFusion-spawned Tokio task fails.
 ///
 /// This DataFusion-owned compatibility wrapper keeps Tokio's join error out of
-/// DataFusion's public runtime APIs while preserving the cancellation and panic
-/// inspection methods callers use today. It represents join failures for
-/// Tokio-backed task APIs, including Tokio local tasks; non-Tokio local or
+/// DataFusion's public runtime API signatures while preserving the cancellation
+/// and panic inspection methods callers use today. It represents join failures
+/// for Tokio-backed task APIs, including Tokio local tasks; non-Tokio local or
 /// thread-affine runtimes will need separate abstractions.
 #[derive(Debug)]
 pub struct JoinError {
@@ -76,7 +76,7 @@ impl Display for JoinError {
 
 impl Error for JoinError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        None
+        Some(&self.inner)
     }
 }
 
@@ -87,16 +87,18 @@ mod tests {
     use std::future::pending;
 
     #[tokio::test]
-    async fn source_does_not_expose_tokio_join_error() {
+    async fn source_preserves_underlying_join_error() {
         #[expect(
             clippy::disallowed_methods,
-            reason = "test needs a raw Tokio JoinError to verify it is not exposed"
+            reason = "test needs a raw Tokio JoinError to verify it is preserved as the source"
         )]
         let handle = tokio::spawn(pending::<()>());
         handle.abort();
 
         let error = JoinError::from_tokio(handle.await.unwrap_err());
         assert!(error.is_cancelled());
-        assert!(error.source().is_none());
+        let source = error.source().unwrap();
+        let source = source.downcast_ref::<tokio::task::JoinError>().unwrap();
+        assert!(source.is_cancelled());
     }
 }
