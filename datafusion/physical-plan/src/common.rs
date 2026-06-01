@@ -184,32 +184,56 @@ pub fn project_plan_to_schema(
 /// If running in a tokio context spawns the execution of `stream` to a separate task
 /// allowing it to execute in parallel with an intermediate buffer of size `buffer`
 pub fn spawn_buffered(
-    mut input: SendableRecordBatchStream,
+    input: SendableRecordBatchStream,
     buffer: usize,
 ) -> SendableRecordBatchStream {
     // Buffer only when running from a multi-thread runtime context.
     match RuntimeHandle::try_current() {
         Ok(handle) if handle.is_multi_thread() => {
-            let mut builder = RecordBatchReceiverStream::builder(input.schema(), buffer);
-
-            let sender = builder.tx();
-
-            builder.spawn(async move {
-                while let Some(item) = input.next().await {
-                    if sender.send(item).await.is_err() {
-                        // Receiver dropped when query is shutdown early (e.g., limit) or error,
-                        // no need to return propagate the send error.
-                        return Ok(());
-                    }
-                }
-
-                Ok(())
-            });
-
-            builder.build()
+            spawn_buffered_on_runtime(input, buffer, &handle)
         }
         _ => input,
     }
+}
+
+/// Spawns the execution of `stream` to a separate task on the provided runtime,
+/// allowing it to execute in parallel with an intermediate buffer of size `buffer`.
+///
+/// Returns `stream` unchanged if `runtime` is not multi-threaded. This matches
+/// [`spawn_buffered`], which only buffers on a multi-thread runtime.
+///
+/// The provided runtime must remain available while the returned stream is
+/// consumed; if it shuts down early, the producer task can be cancelled and the
+/// returned stream will surface that join failure.
+pub fn spawn_buffered_on_runtime(
+    mut input: SendableRecordBatchStream,
+    buffer: usize,
+    runtime: &RuntimeHandle,
+) -> SendableRecordBatchStream {
+    if !runtime.is_multi_thread() {
+        return input;
+    }
+
+    let mut builder = RecordBatchReceiverStream::builder(input.schema(), buffer);
+
+    let sender = builder.tx();
+
+    builder.spawn_on_runtime(
+        async move {
+            while let Some(item) = input.next().await {
+                if sender.send(item).await.is_err() {
+                    // Receiver dropped when query is shutdown early (e.g., limit) or error,
+                    // no need to return propagate the send error.
+                    return Ok(());
+                }
+            }
+
+            Ok(())
+        },
+        runtime,
+    );
+
+    builder.build()
 }
 
 /// Computes the statistics for an in-memory RecordBatch
@@ -296,8 +320,10 @@ mod tests {
     use super::*;
     use crate::empty::EmptyExec;
     use crate::projection::ProjectionExec;
+    use crate::stream::RecordBatchStreamAdapter;
 
     use std::collections::HashMap;
+    use std::task::{Context, Poll};
 
     use arrow::{
         array::{Float32Array, Float64Array, UInt64Array},
@@ -306,6 +332,65 @@ mod tests {
 
     fn empty_exec(fields: Vec<Field>) -> Arc<dyn ExecutionPlan> {
         Arc::new(EmptyExec::new(Arc::new(Schema::new(fields))))
+    }
+
+    #[test]
+    fn spawn_buffered_on_runtime_uses_provided_multi_thread_runtime() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("spawn-buffered-on-runtime-test")
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_handle = RuntimeHandle::from_tokio(runtime.handle().clone());
+
+        let schema = Arc::new(Schema::empty());
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let (thread_name_sender, thread_name_receiver) = std::sync::mpsc::channel();
+
+        let input = futures::stream::once(async move {
+            thread_name_sender
+                .send(std::thread::current().name().unwrap_or("").to_string())
+                .unwrap();
+            Ok(batch)
+        });
+        let input = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input))
+            as SendableRecordBatchStream;
+
+        let output = spawn_buffered_on_runtime(input, 1, &runtime_handle);
+        let batches = runtime.block_on(collect(output))?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            thread_name_receiver.recv().unwrap(),
+            "spawn-buffered-on-runtime-test"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_buffered_on_runtime_returns_input_for_current_thread_runtime() -> Result<()>
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let runtime_handle = RuntimeHandle::from_tokio(runtime.handle().clone());
+
+        let schema = Arc::new(Schema::empty());
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let input = futures::stream::iter(vec![Ok(batch)]);
+        let input = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input))
+            as SendableRecordBatchStream;
+
+        let mut output = spawn_buffered_on_runtime(input, 1, &runtime_handle);
+        let poll = output
+            .poll_next_unpin(&mut Context::from_waker(futures::task::noop_waker_ref()));
+
+        match poll {
+            Poll::Ready(Some(Ok(batch))) => assert_eq!(batch.num_rows(), 0),
+            other => panic!("expected input stream to be polled directly, got {other:?}"),
+        }
+        Ok(())
     }
 
     #[test]
