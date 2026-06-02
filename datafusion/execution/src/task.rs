@@ -401,4 +401,36 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn task_context_runtime_handle_is_explicit() {
+        let runtime = Arc::new(RuntimeEnv::default());
+        let task_context = TaskContext::new(
+            None,
+            "session_id".to_string(),
+            SessionConfig::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            Arc::clone(&runtime),
+        );
+        assert!(task_context.runtime_handle().is_none());
+
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        let runtime_handle = RuntimeHandle::from_tokio(tokio_runtime.handle().clone());
+        let task_context = TaskContext::new_with_runtime_handle(
+            None,
+            "session_id".to_string(),
+            SessionConfig::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            runtime,
+            Some(runtime_handle),
+        );
+
+        assert!(task_context.runtime_handle().is_some());
+    }
 }
