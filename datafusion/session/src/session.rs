@@ -18,6 +18,7 @@
 use async_trait::async_trait;
 use datafusion_common::config::{ConfigOptions, TableOptions};
 use datafusion_common::{DFSchema, Result};
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -153,7 +154,7 @@ pub trait Session: Send + Sync {
 impl From<&dyn Session> for TaskContext {
     fn from(state: &dyn Session) -> Self {
         let task_id = None;
-        TaskContext::new(
+        TaskContext::new_with_runtime_handle(
             task_id,
             state.session_id().to_string(),
             state.config().clone(),
@@ -162,8 +163,8 @@ impl From<&dyn Session> for TaskContext {
             state.aggregate_functions().clone(),
             state.window_functions().clone(),
             Arc::clone(state.runtime_env()),
+            RuntimeHandle::try_current().ok(),
         )
-        .with_current_runtime_handle()
     }
 }
 type SessionRefLock = Arc<Mutex<Option<Weak<RwLock<dyn Session>>>>>;

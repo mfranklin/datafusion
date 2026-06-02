@@ -107,6 +107,36 @@ impl TaskContext {
         window_functions: HashMap<String, Arc<WindowUDF>>,
         runtime: Arc<RuntimeEnv>,
     ) -> Self {
+        Self::new_with_runtime_handle(
+            task_id,
+            session_id,
+            session_config,
+            scalar_functions,
+            higher_order_functions,
+            aggregate_functions,
+            window_functions,
+            runtime,
+            None,
+        )
+    }
+
+    /// Create a new [`TaskContext`] instance with an explicit runtime handle.
+    ///
+    /// The handle is optional because task contexts can be constructed outside
+    /// a running async runtime. Operators that need to spawn work can use the
+    /// handle when present and fall back to non-spawned execution otherwise.
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_with_runtime_handle(
+        task_id: Option<String>,
+        session_id: String,
+        session_config: SessionConfig,
+        scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+        higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
+        aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+        window_functions: HashMap<String, Arc<WindowUDF>>,
+        runtime: Arc<RuntimeEnv>,
+        runtime_handle: Option<RuntimeHandle>,
+    ) -> Self {
         Self {
             task_id,
             session_id,
@@ -116,7 +146,7 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
-            runtime_handle: None,
+            runtime_handle,
         }
     }
 
@@ -181,12 +211,6 @@ impl TaskContext {
     /// Update the runtime handle used for spawning execution tasks.
     pub fn with_runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
         self.runtime_handle = Some(runtime_handle);
-        self
-    }
-
-    /// Use the runtime currently running on this thread for spawning execution tasks.
-    pub fn with_current_runtime_handle(mut self) -> Self {
-        self.runtime_handle = RuntimeHandle::try_current().ok();
         self
     }
 }
