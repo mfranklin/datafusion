@@ -85,7 +85,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
-            runtime_handle: RuntimeHandle::try_current().ok(),
+            runtime_handle: None,
         }
     }
 }
@@ -116,7 +116,7 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
-            runtime_handle: RuntimeHandle::try_current().ok(),
+            runtime_handle: None,
         }
     }
 
@@ -181,6 +181,12 @@ impl TaskContext {
     /// Update the runtime handle used for spawning execution tasks.
     pub fn with_runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
         self.runtime_handle = Some(runtime_handle);
+        self
+    }
+
+    /// Use the runtime currently running on this thread for spawning execution tasks.
+    pub fn with_current_runtime_handle(mut self) -> Self {
+        self.runtime_handle = RuntimeHandle::try_current().ok();
         self
     }
 }

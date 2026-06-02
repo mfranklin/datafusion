@@ -2298,6 +2298,7 @@ impl From<&SessionState> for TaskContext {
             state.window_functions.clone(),
             Arc::clone(&state.runtime_env),
         )
+        .with_current_runtime_handle()
     }
 }
 
