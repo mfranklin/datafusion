@@ -19,11 +19,12 @@
 
 use super::{SpillReaderStream, in_progress_spill_file::InProgressSpillFile};
 use crate::coop::cooperative;
-use crate::{common::spawn_buffered, metrics::SpillMetrics};
+use crate::{common::spawn_buffered_on_runtime, metrics::SpillMetrics};
 use arrow::array::{BinaryViewArray, GenericByteViewArray, StringViewArray};
 use arrow::datatypes::{ByteViewType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result, config::SpillCompression};
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -45,6 +46,7 @@ pub struct SpillManager {
     batch_read_buffer_capacity: usize,
     /// general-purpose compression options
     pub(crate) compression: SpillCompression,
+    runtime_handle: Option<RuntimeHandle>,
 }
 
 impl SpillManager {
@@ -55,7 +57,13 @@ impl SpillManager {
             schema,
             batch_read_buffer_capacity: 2,
             compression: SpillCompression::default(),
+            runtime_handle: None,
         }
+    }
+
+    pub fn with_runtime_handle(mut self, runtime_handle: Option<RuntimeHandle>) -> Self {
+        self.runtime_handle = runtime_handle;
+        self
     }
 
     pub fn with_batch_read_buffer_capacity(
@@ -185,9 +193,16 @@ impl SpillManager {
             Arc::clone(&self.schema),
             spill_file_path,
             max_record_batch_memory,
-        )));
+        ))) as SendableRecordBatchStream;
 
-        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+        Ok(match &self.runtime_handle {
+            Some(runtime) => spawn_buffered_on_runtime(
+                stream,
+                self.batch_read_buffer_capacity,
+                runtime,
+            ),
+            None => stream,
+        })
     }
 
     /// Same as `read_spill_as_stream`, but without buffering.

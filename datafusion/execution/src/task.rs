@@ -20,6 +20,7 @@ use crate::{
     runtime_env::RuntimeEnv,
 };
 use datafusion_common::{Result, internal_datafusion_err, plan_datafusion_err};
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
 use std::collections::HashSet;
@@ -66,6 +67,8 @@ pub struct TaskContext {
     window_functions: HashMap<String, Arc<WindowUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
+    /// Runtime handle for spawning execution tasks, if available
+    runtime_handle: Option<RuntimeHandle>,
 }
 
 impl Default for TaskContext {
@@ -82,6 +85,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
+            runtime_handle: RuntimeHandle::try_current().ok(),
         }
     }
 }
@@ -112,6 +116,7 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
+            runtime_handle: RuntimeHandle::try_current().ok(),
         }
     }
 
@@ -140,6 +145,11 @@ impl TaskContext {
         Arc::clone(&self.runtime)
     }
 
+    /// Return the runtime handle associated with this [TaskContext], if available.
+    pub fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        self.runtime_handle.as_ref()
+    }
+
     pub fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
         &self.scalar_functions
     }
@@ -165,6 +175,12 @@ impl TaskContext {
     /// Update the [`RuntimeEnv`]
     pub fn with_runtime(mut self, runtime: Arc<RuntimeEnv>) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Update the runtime handle used for spawning execution tasks.
+    pub fn with_runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
+        self.runtime_handle = Some(runtime_handle);
         self
     }
 }

@@ -251,6 +251,8 @@ struct ExternalSorter {
     metrics: ExternalSorterMetrics,
     /// A handle to the runtime to get spill files
     runtime: Arc<RuntimeEnv>,
+    /// Runtime handle for spawning buffered stream producers, if available.
+    runtime_handle: Option<RuntimeHandle>,
     /// Reservation for in_mem_batches
     reservation: MemoryReservation,
     spill_manager: SpillManager,
@@ -279,6 +281,7 @@ impl ExternalSorter {
         spill_compression: SpillCompression,
         metrics: &ExecutionPlanMetricsSet,
         runtime: Arc<RuntimeEnv>,
+        runtime_handle: Option<RuntimeHandle>,
     ) -> Result<Self> {
         let metrics = ExternalSorterMetrics::new(metrics, partition_id);
         let reservation = MemoryConsumer::new(format!("ExternalSorter[{partition_id}]"))
@@ -294,7 +297,8 @@ impl ExternalSorter {
             metrics.spill_metrics.clone(),
             Arc::clone(&schema),
         )
-        .with_compression_type(spill_compression);
+        .with_compression_type(spill_compression)
+        .with_runtime_handle(runtime_handle.clone());
 
         Ok(Self {
             schema,
@@ -307,6 +311,7 @@ impl ExternalSorter {
             spill_manager,
             merge_reservation,
             runtime,
+            runtime_handle,
             batch_size,
             sort_spill_reservation_bytes,
             sort_in_place_threshold_bytes,
@@ -623,7 +628,6 @@ impl ExternalSorter {
             return self.sort_batch_stream(batch, &metrics, reservation);
         }
 
-        let runtime_handle = RuntimeHandle::try_current().ok();
         let streams = std::mem::take(&mut self.in_mem_batches)
             .into_iter()
             .map(|batch| {
@@ -632,7 +636,7 @@ impl ExternalSorter {
                     .reservation
                     .split(get_reserved_bytes_for_record_batch(&batch)?);
                 let input = self.sort_batch_stream(batch, &metrics, reservation)?;
-                Ok(match &runtime_handle {
+                Ok(match &self.runtime_handle {
                     Some(runtime) => spawn_buffered_on_runtime(input, 1, runtime),
                     None => input,
                 })
@@ -1267,6 +1271,7 @@ impl ExecutionPlan for SortExec {
                     context.session_config().spill_compression(),
                     &self.metrics_set,
                     context.runtime_env(),
+                    context.runtime_handle().cloned(),
                 )?;
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
@@ -2836,6 +2841,7 @@ mod tests {
             SpillCompression::Uncompressed,
             &metrics_set,
             Arc::clone(&runtime),
+            None,
         )?;
 
         // Insert enough data to force spilling.

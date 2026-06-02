@@ -511,7 +511,8 @@ impl ExecutionPlan for SortMergeJoinExec {
             SpillMetrics::new(&self.metrics, partition),
             buffered.schema(),
         )
-        .with_compression_type(context.session_config().spill_compression());
+        .with_compression_type(context.session_config().spill_compression())
+        .with_runtime_handle(context.runtime_handle().cloned());
 
         if matches!(
             self.join_type,

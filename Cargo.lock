@@ -2096,6 +2096,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion-common",
+ "datafusion-common-runtime",
  "datafusion-expr",
  "datafusion-physical-expr-common",
  "futures",

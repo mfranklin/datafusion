@@ -1239,7 +1239,8 @@ impl ExecutionPlan for RepartitionExec {
             Arc::clone(&context.runtime_env()),
             spill_metrics,
             input.schema(),
-        );
+        )
+        .with_runtime_handle(context.runtime_handle().cloned());
 
         // Get existing ordering to use for merging
         let sort_exprs = self.sort_exprs().cloned();
