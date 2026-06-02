@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::common::spawn_buffered;
+use crate::common::spawn_buffered_on_runtime;
 use crate::limit::LimitStream;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
@@ -31,6 +31,7 @@ use crate::{
 };
 
 use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
@@ -344,11 +345,17 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 }
             },
             _ => {
+                let runtime_handle = RuntimeHandle::try_current().ok();
                 let receivers = (0..input_partitions)
                     .map(|partition| {
                         let stream =
                             self.input.execute(partition, Arc::clone(&context))?;
-                        Ok(spawn_buffered(stream, 1))
+                        Ok(match &runtime_handle {
+                            Some(runtime) => {
+                                spawn_buffered_on_runtime(stream, 1, runtime)
+                            }
+                            None => stream,
+                        })
                     })
                     .collect::<Result<_>>()?;
 

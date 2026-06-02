@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::common::spawn_buffered;
+use crate::common::spawn_buffered_on_runtime;
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
 };
@@ -63,6 +63,7 @@ use datafusion_common::{
     DataFusionError, Result, assert_or_internal_err, internal_datafusion_err,
     unwrap_or_internal_err,
 };
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -622,6 +623,7 @@ impl ExternalSorter {
             return self.sort_batch_stream(batch, &metrics, reservation);
         }
 
+        let runtime_handle = RuntimeHandle::try_current().ok();
         let streams = std::mem::take(&mut self.in_mem_batches)
             .into_iter()
             .map(|batch| {
@@ -630,7 +632,10 @@ impl ExternalSorter {
                     .reservation
                     .split(get_reserved_bytes_for_record_batch(&batch)?);
                 let input = self.sort_batch_stream(batch, &metrics, reservation)?;
-                Ok(spawn_buffered(input, 1))
+                Ok(match &runtime_handle {
+                    Some(runtime) => spawn_buffered_on_runtime(input, 1, runtime),
+                    None => input,
+                })
             })
             .collect::<Result<_>>()?;
 
