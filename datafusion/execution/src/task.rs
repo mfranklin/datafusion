@@ -85,7 +85,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
-            runtime_handle: None,
+            runtime_handle: RuntimeHandle::try_current().ok(),
         }
     }
 }
@@ -432,5 +432,17 @@ mod tests {
         );
 
         assert!(task_context.runtime_handle().is_some());
+    }
+
+    #[test]
+    fn task_context_default_uses_current_runtime_when_available() {
+        let task_context = TaskContext::default();
+        assert!(task_context.runtime_handle().is_none());
+
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        tokio_runtime.block_on(async {
+            let task_context = TaskContext::default();
+            assert!(task_context.runtime_handle().is_some());
+        });
     }
 }
