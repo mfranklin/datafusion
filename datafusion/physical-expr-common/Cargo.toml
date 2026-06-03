@@ -42,6 +42,7 @@ name = "datafusion_physical_expr_common"
 
 [features]
 default = []
+force_hash_collisions = ["datafusion-common/force_hash_collisions"]
 # Enables the `PhysicalExpr::to_proto` hook used by `datafusion-proto`.
 # Off by default so crates that never serialize plans pay nothing.
 proto = ["dep:datafusion-proto-models"]
