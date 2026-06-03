@@ -52,7 +52,8 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::utils::transpose;
 use datafusion_common::{
-    ColumnStatistics, DataFusionError, HashMap, assert_or_internal_err, internal_err,
+    ColumnStatistics, DataFusionError, HashMap, assert_or_internal_err,
+    internal_datafusion_err, internal_err,
 };
 use datafusion_common::{Result, not_impl_err};
 use datafusion_common_runtime::SpawnedTask;
@@ -419,6 +420,11 @@ impl RepartitionExecState {
 
         let num_input_partitions = streams_and_metrics.len();
         let num_output_partitions = partitioning.partition_count();
+        let runtime_handle = context.runtime_handle().ok_or_else(|| {
+            internal_datafusion_err!(
+                "RepartitionExec requires a runtime handle to spawn input tasks"
+            )
+        })?;
 
         let spill_manager = Arc::new(spill_manager);
 
@@ -525,20 +531,25 @@ impl RepartitionExecState {
                 .map(|(partition, channel)| (*partition, channel.sender.clone()))
                 .collect();
 
-            let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
-                stream,
-                txs,
-                partitioning.clone(),
-                metrics,
-                // preserve_order depends on partition index to start from 0
-                if preserve_order { 0 } else { i },
-                num_input_partitions,
-            ));
+            let input_task = SpawnedTask::spawn_on_runtime(
+                RepartitionExec::pull_from_input(
+                    stream,
+                    txs,
+                    partitioning.clone(),
+                    metrics,
+                    // preserve_order depends on partition index to start from 0
+                    if preserve_order { 0 } else { i },
+                    num_input_partitions,
+                ),
+                runtime_handle,
+            );
 
             // In a separate task, wait for each input to be done
             // (and pass along any errors, including panic!s)
-            let wait_for_task =
-                SpawnedTask::spawn(RepartitionExec::wait_for_task(input_task, senders));
+            let wait_for_task = SpawnedTask::spawn_on_runtime(
+                RepartitionExec::wait_for_task(input_task, senders),
+                runtime_handle,
+            );
             spawned_tasks.push(wait_for_task);
         }
         *self = Self::ConsumingInputStreams(ConsumingInputStreamsState {
