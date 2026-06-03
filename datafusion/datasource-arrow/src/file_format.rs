@@ -335,7 +335,7 @@ impl FileSink for ArrowFileSink {
         demux_task
             .join_unwind()
             .await
-            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+            .map_err(DataFusionError::execution_join)??;
         Ok(row_count as u64)
     }
 }

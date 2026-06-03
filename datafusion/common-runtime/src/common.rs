@@ -21,9 +21,120 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinHandle;
 
+use crate::join_error::JoinError;
+use crate::join_set::{JoinSet, TaskHandle};
+use crate::runtime::RuntimeHandle;
 use crate::trace_utils::{trace_block, trace_future};
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// DataFusion-owned compatibility abstraction for spawning a single task.
+///
+/// This trait is backed by Tokio today and preserves DataFusion's existing
+/// `Send + 'static` single-task spawning semantics by returning [`SpawnedTask`].
+/// It is DataFusion-owned and is not currently an external executor plugin
+/// point. Its generic methods mean it is not a `dyn Executor` abstraction yet.
+/// Runtimes that support `!Send` local tasks need separate abstractions.
+pub trait TaskSpawner: private::Sealed {
+    /// Spawn an asynchronous task.
+    fn spawn<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static;
+
+    /// Spawn a blocking task.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    fn spawn_blocking<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static;
+}
+
+impl private::Sealed for RuntimeHandle {}
+
+impl TaskSpawner for RuntimeHandle {
+    fn spawn<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        SpawnedTask::spawn_on_runtime(task, self)
+    }
+
+    fn spawn_blocking<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        SpawnedTask::spawn_blocking_on_runtime(task, self)
+    }
+}
+
+/// DataFusion-owned compatibility abstraction for spawning fan-out work into a
+/// [`JoinSet`].
+///
+/// This trait is backed by Tokio today and preserves DataFusion's existing
+/// `Send + 'static` fan-out spawning semantics by inserting into an existing
+/// [`JoinSet`] and returning [`TaskHandle`]. It is DataFusion-owned and is not
+/// an external executor plugin point. Runtimes that support `!Send` local tasks
+/// need separate abstractions; this trait is not a `!Send` local runtime
+/// abstraction.
+pub trait JoinSetSpawner: private::Sealed {
+    /// Spawn an asynchronous task into an existing join set.
+    fn spawn_join_set<T, R>(&self, join_set: &mut JoinSet<R>, task: T) -> TaskHandle
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static;
+
+    /// Spawn a blocking task into an existing join set.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    fn spawn_blocking_join_set<T, R>(
+        &self,
+        join_set: &mut JoinSet<R>,
+        task: T,
+    ) -> TaskHandle
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static;
+}
+
+impl JoinSetSpawner for RuntimeHandle {
+    fn spawn_join_set<T, R>(&self, join_set: &mut JoinSet<R>, task: T) -> TaskHandle
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        join_set.spawn_task_on_runtime(task, self)
+    }
+
+    fn spawn_blocking_join_set<T, R>(
+        &self,
+        join_set: &mut JoinSet<R>,
+        task: T,
+    ) -> TaskHandle
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        join_set.spawn_blocking_task_on_runtime(task, self)
+    }
+}
 
 /// Helper that  provides a simple API to spawn a single task and join it.
 /// Provides guarantees of aborting on `Drop` to keep it cancel-safe.
@@ -58,6 +169,31 @@ impl<R: 'static> SpawnedTask<R> {
         // Ok to use spawn_blocking here as SpawnedTask handles aborting/cancelling the task on Drop
         #[expect(clippy::disallowed_methods)]
         let inner = tokio::task::spawn_blocking(trace_block(task));
+        Self { inner }
+    }
+
+    /// Spawn a task on a provided DataFusion runtime handle.
+    pub fn spawn_on_runtime<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send,
+    {
+        let inner = handle.as_tokio().spawn(trace_future(task));
+        Self { inner }
+    }
+
+    /// Spawn a blocking task on a provided DataFusion runtime handle.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    pub fn spawn_blocking_on_runtime<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send,
+    {
+        let inner = handle.as_tokio().spawn_blocking(trace_block(task));
         Self { inner }
     }
 
@@ -101,7 +237,9 @@ impl<R> Future for SpawnedTask<R> {
     type Output = Result<R, JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        Pin::new(&mut self.inner)
+            .poll(cx)
+            .map_err(JoinError::from_tokio)
     }
 }
 
@@ -185,5 +323,83 @@ mod tests {
 
         // The sender was dropped so we receive `None`.
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[test]
+    fn spawn_on_runtime_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = SpawnedTask::spawn_on_runtime(async { 42 }, &handle);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn spawn_blocking_on_runtime_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = SpawnedTask::spawn_blocking_on_runtime(|| 42, &handle);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn task_spawner_spawn_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = TaskSpawner::spawn(&handle, async { 42 });
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn task_spawner_spawn_blocking_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = TaskSpawner::spawn_blocking(&handle, || 42);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn join_set_spawner_spawn_joins_with_task_id() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+        let mut join_set = JoinSet::new();
+
+        let task_handle =
+            JoinSetSpawner::spawn_join_set(&handle, &mut join_set, async { 42 });
+        let expected_id = task_handle.id();
+
+        let (task_id, value) = rt
+            .block_on(join_set.join_next_with_task_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_id, expected_id);
+        assert_eq!(value, 42);
+        assert!(task_handle.is_finished());
+    }
+
+    #[test]
+    fn join_set_spawner_spawn_blocking_joins_with_task_id() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+        let mut join_set = JoinSet::new();
+
+        let task_handle =
+            JoinSetSpawner::spawn_blocking_join_set(&handle, &mut join_set, || 42);
+        let expected_id = task_handle.id();
+
+        let (task_id, value) = rt
+            .block_on(join_set.join_next_with_task_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_id, expected_id);
+        assert_eq!(value, 42);
+        assert!(task_handle.is_finished());
     }
 }

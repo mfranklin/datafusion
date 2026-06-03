@@ -20,6 +20,7 @@ use crate::{
     runtime_env::RuntimeEnv,
 };
 use datafusion_common::{Result, internal_datafusion_err, plan_datafusion_err};
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
 use std::collections::HashSet;
@@ -66,6 +67,8 @@ pub struct TaskContext {
     window_functions: HashMap<String, Arc<WindowUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
+    /// Runtime handle for spawning execution tasks, if available
+    runtime_handle: Option<RuntimeHandle>,
 }
 
 impl Default for TaskContext {
@@ -82,6 +85,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
+            runtime_handle: None,
         }
     }
 }
@@ -103,6 +107,36 @@ impl TaskContext {
         window_functions: HashMap<String, Arc<WindowUDF>>,
         runtime: Arc<RuntimeEnv>,
     ) -> Self {
+        Self::new_with_runtime_handle(
+            task_id,
+            session_id,
+            session_config,
+            scalar_functions,
+            higher_order_functions,
+            aggregate_functions,
+            window_functions,
+            runtime,
+            None,
+        )
+    }
+
+    /// Create a new [`TaskContext`] instance with an explicit runtime handle.
+    ///
+    /// The handle is optional because task contexts can be constructed outside
+    /// a running async runtime. Operators that need to spawn work can use the
+    /// handle when present and fall back to non-spawned execution otherwise.
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_with_runtime_handle(
+        task_id: Option<String>,
+        session_id: String,
+        session_config: SessionConfig,
+        scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+        higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
+        aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+        window_functions: HashMap<String, Arc<WindowUDF>>,
+        runtime: Arc<RuntimeEnv>,
+        runtime_handle: Option<RuntimeHandle>,
+    ) -> Self {
         Self {
             task_id,
             session_id,
@@ -112,6 +146,7 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
+            runtime_handle,
         }
     }
 
@@ -140,6 +175,11 @@ impl TaskContext {
         Arc::clone(&self.runtime)
     }
 
+    /// Return the runtime handle associated with this [TaskContext], if available.
+    pub fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        self.runtime_handle.as_ref()
+    }
+
     pub fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
         &self.scalar_functions
     }
@@ -165,6 +205,12 @@ impl TaskContext {
     /// Update the [`RuntimeEnv`]
     pub fn with_runtime(mut self, runtime: Arc<RuntimeEnv>) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Update the runtime handle used for spawning execution tasks.
+    pub fn with_runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
+        self.runtime_handle = Some(runtime_handle);
         self
     }
 }
@@ -354,5 +400,37 @@ mod tests {
         assert_eq!(test.unwrap().option_value, None);
 
         Ok(())
+    }
+
+    #[test]
+    fn task_context_runtime_handle_is_explicit() {
+        let runtime = Arc::new(RuntimeEnv::default());
+        let task_context = TaskContext::new(
+            None,
+            "session_id".to_string(),
+            SessionConfig::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            Arc::clone(&runtime),
+        );
+        assert!(task_context.runtime_handle().is_none());
+
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        let runtime_handle = RuntimeHandle::from_tokio(tokio_runtime.handle().clone());
+        let task_context = TaskContext::new_with_runtime_handle(
+            None,
+            "session_id".to_string(),
+            SessionConfig::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            runtime,
+            Some(runtime_handle),
+        );
+
+        assert!(task_context.runtime_handle().is_some());
     }
 }

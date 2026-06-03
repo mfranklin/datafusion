@@ -1872,7 +1872,6 @@ dependencies = [
  "rand 0.9.4",
  "recursive",
  "sqlparser",
- "tokio",
  "uuid",
  "web-time",
 ]
@@ -2095,6 +2094,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion-common",
+ "datafusion-common-runtime",
  "datafusion-expr",
  "datafusion-physical-expr-common",
  "futures",
@@ -2105,6 +2105,7 @@ dependencies = [
  "parquet",
  "rand 0.9.4",
  "tempfile",
+ "tokio",
  "url",
 ]
 
@@ -2548,6 +2549,7 @@ version = "53.1.0"
 dependencies = [
  "async-trait",
  "datafusion-common",
+ "datafusion-common-runtime",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-physical-plan",

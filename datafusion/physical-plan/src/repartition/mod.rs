@@ -1239,7 +1239,8 @@ impl ExecutionPlan for RepartitionExec {
             Arc::clone(&context.runtime_env()),
             spill_metrics,
             input.schema(),
-        );
+        )
+        .with_runtime_handle(context.runtime_handle().cloned());
 
         // Get existing ordering to use for merging
         let sort_exprs = self.sort_exprs().cloned();
@@ -2468,7 +2469,7 @@ mod tests {
 
         // Now, start sending input
         let mut background_task = JoinSet::new();
-        background_task.spawn(async move {
+        background_task.spawn_task(async move {
             input.wait().await;
         });
 
@@ -2510,7 +2511,7 @@ mod tests {
         .unwrap();
         let output_stream1 = exec.execute(1, Arc::clone(&task_ctx)).unwrap();
         let mut background_task = JoinSet::new();
-        background_task.spawn(async move {
+        background_task.spawn_task(async move {
             input.wait().await;
         });
         let batches_without_drop = crate::common::collect(output_stream1).await.unwrap();
@@ -2539,7 +2540,7 @@ mod tests {
         // *before* any outputs are produced
         drop(output_stream0);
         let mut background_task = JoinSet::new();
-        background_task.spawn(async move {
+        background_task.spawn_task(async move {
             input.wait().await;
         });
         let batches_with_drop = crate::common::collect(output_stream1).await.unwrap();
@@ -2993,6 +2994,7 @@ mod test {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::assert_batches_eq;
+    use datafusion_common_runtime::JoinSet;
 
     use super::*;
     use crate::test::TestMemoryExec;
@@ -3234,10 +3236,10 @@ mod test {
 
         // Collect all partitions concurrently using JoinSet - this prevents deadlock
         // where the distribution channel gate closes when all output channels are full
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut join_set = JoinSet::new();
         for i in 0..exec.partitioning().partition_count() {
             let stream = exec.execute(i, Arc::clone(&task_ctx))?;
-            join_set.spawn(async move {
+            join_set.spawn_task(async move {
                 let mut count = 0;
                 futures::pin_mut!(stream);
                 while let Some(result) = stream.next().await {

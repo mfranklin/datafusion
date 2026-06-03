@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::common::spawn_buffered;
+use crate::common::spawn_buffered_on_runtime;
 use crate::limit::LimitStream;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
@@ -344,11 +344,17 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 }
             },
             _ => {
+                let runtime_handle = context.runtime_handle().cloned();
                 let receivers = (0..input_partitions)
                     .map(|partition| {
                         let stream =
                             self.input.execute(partition, Arc::clone(&context))?;
-                        Ok(spawn_buffered(stream, 1))
+                        Ok(match &runtime_handle {
+                            Some(runtime) => {
+                                spawn_buffered_on_runtime(stream, 1, runtime)
+                            }
+                            None => stream,
+                        })
                     })
                     .collect::<Result<_>>()?;
 

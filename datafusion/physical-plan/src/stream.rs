@@ -31,7 +31,7 @@ use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use datafusion_common::{Result, exec_err};
-use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::{JoinSet, JoinSetSpawner, RuntimeHandle};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
 
@@ -84,20 +84,33 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
-        self.join_set.spawn(task);
+        self.join_set.spawn_task(task);
     }
 
-    /// Same as [`Self::spawn`] but it spawns the task on the provided runtime
+    /// Same as [`Self::spawn`] but it spawns the task on the provided Tokio runtime handle.
     pub fn spawn_on<F>(&mut self, task: F, handle: &Handle)
     where
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
-        self.join_set.spawn_on(task, handle);
+        self.join_set.spawn_task_on(task, handle);
     }
 
-    /// Spawn a blocking task that will be aborted if this builder (or the stream
-    /// built from it) are dropped.
+    /// Same as [`Self::spawn`] but it spawns the task using the provided spawner.
+    pub(crate) fn spawn_with<F, S>(&mut self, task: F, spawner: &S)
+    where
+        F: Future<Output = Result<()>>,
+        F: Send + 'static,
+        S: JoinSetSpawner,
+    {
+        spawner.spawn_join_set(&mut self.join_set, task);
+    }
+
+    /// Spawn a blocking task tied to the builder and stream.
+    ///
+    /// If this builder (or the stream built from it) is dropped before the task
+    /// starts, the task is also dropped and will never execute. Once the
+    /// blocking task has started, it may continue to run to completion.
     ///
     /// This is often used to spawn tasks that write to the sender
     /// retrieved from `Self::tx`.
@@ -106,16 +119,30 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking(f);
+        self.join_set.spawn_blocking_task(f);
     }
 
-    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided runtime
+    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided Tokio runtime handle.
     pub fn spawn_blocking_on<F>(&mut self, f: F, handle: &Handle)
     where
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking_on(f, handle);
+        self.join_set.spawn_blocking_task_on(f, handle);
+    }
+
+    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task using
+    /// the provided spawner.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    pub(crate) fn spawn_blocking_with<F, S>(&mut self, f: F, spawner: &S)
+    where
+        F: FnOnce() -> Result<()>,
+        F: Send + 'static,
+        S: JoinSetSpawner,
+    {
+        spawner.spawn_blocking_join_set(&mut self.join_set, f);
     }
 
     /// Create a stream of all data written to `tx`
@@ -273,13 +300,32 @@ impl RecordBatchReceiverStreamBuilder {
         self.inner.spawn(task)
     }
 
-    /// Same as [`Self::spawn`] but it spawns the task on the provided runtime.
+    /// Same as [`Self::spawn`] but it spawns the task on the provided Tokio runtime handle.
     pub fn spawn_on<F>(&mut self, task: F, handle: &Handle)
     where
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
         self.inner.spawn_on(task, handle)
+    }
+
+    /// Same as [`Self::spawn`] but it spawns the task on the provided DataFusion runtime handle.
+    pub fn spawn_on_runtime<F>(&mut self, task: F, handle: &RuntimeHandle)
+    where
+        F: Future<Output = Result<()>>,
+        F: Send + 'static,
+    {
+        self.spawn_with(task, handle)
+    }
+
+    /// Same as [`Self::spawn`] but it spawns the task using the provided spawner.
+    pub(crate) fn spawn_with<F, S>(&mut self, task: F, spawner: &S)
+    where
+        F: Future<Output = Result<()>>,
+        F: Send + 'static,
+        S: JoinSetSpawner,
+    {
+        self.inner.spawn_with(task, spawner)
     }
 
     /// Spawn a blocking task tied to the builder and stream.
@@ -309,13 +355,36 @@ impl RecordBatchReceiverStreamBuilder {
         self.inner.spawn_blocking(f)
     }
 
-    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided runtime.
+    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided Tokio runtime handle.
     pub fn spawn_blocking_on<F>(&mut self, f: F, handle: &Handle)
     where
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
         self.inner.spawn_blocking_on(f, handle)
+    }
+
+    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided DataFusion runtime handle.
+    pub fn spawn_blocking_on_runtime<F>(&mut self, f: F, handle: &RuntimeHandle)
+    where
+        F: FnOnce() -> Result<()>,
+        F: Send + 'static,
+    {
+        self.spawn_blocking_with(f, handle)
+    }
+
+    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task using
+    /// the provided spawner.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    pub(crate) fn spawn_blocking_with<F, S>(&mut self, f: F, spawner: &S)
+    where
+        F: FnOnce() -> Result<()>,
+        F: Send + 'static,
+        S: JoinSetSpawner,
+    {
+        self.inner.spawn_blocking_with(f, spawner)
     }
 
     /// Runs the `partition` of the `input` ExecutionPlan on the
@@ -979,18 +1048,14 @@ mod test {
         }
     }
 
-    #[test]
-    fn record_batch_receiver_stream_builder_spawn_on_runtime() {
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
+    #[tokio::test]
+    async fn record_batch_receiver_stream_builder_spawn_with() {
+        let runtime_handle = RuntimeHandle::from_tokio(Handle::current());
         let mut builder =
             RecordBatchReceiverStreamBuilder::new(Arc::new(Schema::empty()), 10);
 
         let tx1 = builder.tx();
-        builder.spawn_on(
+        builder.spawn_with(
             async move {
                 tx1.send(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
                     .await
@@ -998,18 +1063,66 @@ mod test {
 
                 Ok(())
             },
-            tokio_runtime.handle(),
+            &runtime_handle,
         );
 
         let tx2 = builder.tx();
-        builder.spawn_blocking_on(
+        builder.spawn_blocking_with(
             move || {
                 tx2.blocking_send(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
                     .unwrap();
 
                 Ok(())
             },
-            tokio_runtime.handle(),
+            &runtime_handle,
+        );
+
+        let mut stream = builder.build();
+        let mut number_of_batches = 0;
+
+        while let Some(batch) = stream.next().await.transpose().unwrap() {
+            number_of_batches += 1;
+            assert_eq!(batch.num_rows(), 0);
+        }
+
+        assert_eq!(
+            number_of_batches, 2,
+            "Should have received exactly two empty batches"
+        );
+    }
+
+    #[test]
+    fn record_batch_receiver_stream_builder_spawn_on_runtime() {
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_handle = RuntimeHandle::from_tokio(tokio_runtime.handle().clone());
+
+        let mut builder =
+            RecordBatchReceiverStreamBuilder::new(Arc::new(Schema::empty()), 10);
+
+        let tx1 = builder.tx();
+        builder.spawn_on_runtime(
+            async move {
+                tx1.send(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
+                    .await
+                    .unwrap();
+
+                Ok(())
+            },
+            &runtime_handle,
+        );
+
+        let tx2 = builder.tx();
+        builder.spawn_blocking_on_runtime(
+            move || {
+                tx2.blocking_send(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
+                    .unwrap();
+
+                Ok(())
+            },
+            &runtime_handle,
         );
 
         let mut stream = builder.build();

@@ -3826,11 +3826,11 @@ async fn consume_stream_until_finish_barrier_reached(
                     switch_to_finish_barrier = true;
 
                     let right = Arc::clone(&right);
-                    background_task.spawn(async move {
+                    background_task.spawn_task(async move {
                         right.wait_finish().await;
                     });
                     let left = Arc::clone(&left);
-                    background_task.spawn(async move {
+                    background_task.spawn_task(async move {
                         left.wait_finish().await;
                     });
                 }

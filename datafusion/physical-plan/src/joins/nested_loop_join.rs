@@ -1388,7 +1388,8 @@ impl NestedLoopJoinStream {
                     spill_metrics,
                     Arc::clone(&schema),
                 )
-                .with_compression_type(ctx.session_config().spill_compression());
+                .with_compression_type(ctx.session_config().spill_compression())
+                .with_runtime_handle(ctx.runtime_handle().cloned());
 
                 let result = left_spill_manager
                     .spill_record_batch_stream_and_return_max_batch_memory(
@@ -1437,7 +1438,8 @@ impl NestedLoopJoinStream {
             self.metrics.spill_metrics.clone(),
             right_schema,
         )
-        .with_compression_type(context.session_config().spill_compression());
+        .with_compression_type(context.session_config().spill_compression())
+        .with_runtime_handle(context.runtime_handle().cloned());
 
         self.spill_state = SpillState::Active(Box::new(SpillStateActive {
             left_spill_fut,

@@ -610,7 +610,8 @@ impl GroupedHashAggregateStream {
             metrics::SpillMetrics::new(&agg.metrics, partition),
             Arc::clone(&spill_schema),
         )
-        .with_compression_type(context.session_config().spill_compression());
+        .with_compression_type(context.session_config().spill_compression())
+        .with_runtime_handle(context.runtime_handle().cloned());
 
         let spill_state = SpillState {
             spills: vec![],

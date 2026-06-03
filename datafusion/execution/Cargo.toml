@@ -57,6 +57,7 @@ arrow-buffer = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 datafusion-common = { workspace = true, default-features = false }
+datafusion-common-runtime = { workspace = true }
 datafusion-expr = { workspace = true, default-features = false }
 datafusion-physical-expr-common = { workspace = true, default-features = false }
 futures = { workspace = true }
@@ -71,3 +72,4 @@ url = { workspace = true }
 [dev-dependencies]
 chrono = { workspace = true }
 insta = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

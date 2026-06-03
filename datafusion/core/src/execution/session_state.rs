@@ -46,6 +46,7 @@ use datafusion_common::{
     DFSchema, DataFusionError, ResolvedTableReference, TableReference, config_err,
     exec_err, plan_datafusion_err,
 };
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -2288,7 +2289,7 @@ impl OptimizerConfig for SessionState {
 impl From<&SessionState> for TaskContext {
     fn from(state: &SessionState) -> Self {
         let task_id = None;
-        TaskContext::new(
+        TaskContext::new_with_runtime_handle(
             task_id,
             state.session_id.clone(),
             state.config.clone(),
@@ -2297,6 +2298,7 @@ impl From<&SessionState> for TaskContext {
             state.aggregate_functions.clone(),
             state.window_functions.clone(),
             Arc::clone(&state.runtime_env),
+            RuntimeHandle::try_current().ok(),
         )
     }
 }

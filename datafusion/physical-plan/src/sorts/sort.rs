@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::common::spawn_buffered;
+use crate::common::spawn_buffered_on_runtime;
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
 };
@@ -63,6 +63,7 @@ use datafusion_common::{
     DataFusionError, Result, assert_or_internal_err, internal_datafusion_err,
     unwrap_or_internal_err,
 };
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -250,6 +251,8 @@ struct ExternalSorter {
     metrics: ExternalSorterMetrics,
     /// A handle to the runtime to get spill files
     runtime: Arc<RuntimeEnv>,
+    /// Runtime handle for spawning buffered stream producers, if available.
+    runtime_handle: Option<RuntimeHandle>,
     /// Reservation for in_mem_batches
     reservation: MemoryReservation,
     spill_manager: SpillManager,
@@ -278,6 +281,7 @@ impl ExternalSorter {
         spill_compression: SpillCompression,
         metrics: &ExecutionPlanMetricsSet,
         runtime: Arc<RuntimeEnv>,
+        runtime_handle: Option<RuntimeHandle>,
     ) -> Result<Self> {
         let metrics = ExternalSorterMetrics::new(metrics, partition_id);
         let reservation = MemoryConsumer::new(format!("ExternalSorter[{partition_id}]"))
@@ -293,7 +297,8 @@ impl ExternalSorter {
             metrics.spill_metrics.clone(),
             Arc::clone(&schema),
         )
-        .with_compression_type(spill_compression);
+        .with_compression_type(spill_compression)
+        .with_runtime_handle(runtime_handle.clone());
 
         Ok(Self {
             schema,
@@ -306,6 +311,7 @@ impl ExternalSorter {
             spill_manager,
             merge_reservation,
             runtime,
+            runtime_handle,
             batch_size,
             sort_spill_reservation_bytes,
             sort_in_place_threshold_bytes,
@@ -630,7 +636,10 @@ impl ExternalSorter {
                     .reservation
                     .split(get_reserved_bytes_for_record_batch(&batch)?);
                 let input = self.sort_batch_stream(batch, &metrics, reservation)?;
-                Ok(spawn_buffered(input, 1))
+                Ok(match &self.runtime_handle {
+                    Some(runtime) => spawn_buffered_on_runtime(input, 1, runtime),
+                    None => input,
+                })
             })
             .collect::<Result<_>>()?;
 
@@ -1262,6 +1271,7 @@ impl ExecutionPlan for SortExec {
                     context.session_config().spill_compression(),
                     &self.metrics_set,
                     context.runtime_env(),
+                    context.runtime_handle().cloned(),
                 )?;
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
@@ -2831,6 +2841,7 @@ mod tests {
             SpillCompression::Uncompressed,
             &metrics_set,
             Arc::clone(&runtime),
+            None,
         )?;
 
         // Insert enough data to force spilling.
