@@ -427,7 +427,7 @@ where
                 // Check if the value is already present in the set
                 let entry = self.map.find_mut(hash, |header| {
                     // compare value if hashes match
-                    if header.hash != hash {
+                    if header.hash != hash || header.len != value_len {
                         return false;
                     }
                     // Need to compare the bytes in the buffer
@@ -634,6 +634,18 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert_eq!(set.non_null_len(), 0);
         assert_set(set, &[None]);
+    }
+
+    #[cfg(feature = "force_hash_collisions")]
+    #[test]
+    fn string_set_handles_short_long_hash_collision() {
+        let mut set = ArrowBytesSet::<i32>::new(OutputType::Utf8);
+        let array: ArrayRef = Arc::new(StringArray::from(vec!["a", "123456789"]));
+
+        set.insert(&array);
+
+        assert_eq!(set.len(), 2);
+        assert_set(set, &[Some("a"), Some("123456789")]);
     }
 
     #[test]
