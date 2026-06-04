@@ -16,14 +16,128 @@
 // under the License.
 
 use std::{
+    fmt::{Debug, Formatter},
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
-use tokio::task::{JoinError, JoinHandle};
+use futures::FutureExt;
+use tokio::sync::oneshot;
 
+use crate::join_error::JoinError;
+use crate::join_set::{JoinSet, TaskHandle};
+use crate::runtime::{RuntimeHandle, SpawnHandle};
 use crate::trace_utils::{trace_block, trace_future};
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// DataFusion-owned compatibility abstraction for spawning a single task.
+///
+/// This trait is backed by Tokio today and preserves DataFusion's existing
+/// `Send + 'static` single-task spawning semantics by returning [`SpawnedTask`].
+/// It is DataFusion-owned and is not currently an external executor plugin
+/// point. Its generic methods mean it is not a `dyn Executor` abstraction yet.
+/// Runtimes that support `!Send` local tasks need separate abstractions.
+pub trait TaskSpawner: private::Sealed {
+    /// Spawn an asynchronous task.
+    fn spawn<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static;
+
+    /// Spawn a blocking task.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    fn spawn_blocking<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static;
+}
+
+impl private::Sealed for RuntimeHandle {}
+
+impl TaskSpawner for RuntimeHandle {
+    fn spawn<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        SpawnedTask::spawn_on_runtime(task, self)
+    }
+
+    fn spawn_blocking<T, R>(&self, task: T) -> SpawnedTask<R>
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        SpawnedTask::spawn_blocking_on_runtime(task, self)
+    }
+}
+
+/// DataFusion-owned compatibility abstraction for spawning fan-out work into a
+/// [`JoinSet`].
+///
+/// This trait is backed by Tokio today and preserves DataFusion's existing
+/// `Send + 'static` fan-out spawning semantics by inserting into an existing
+/// [`JoinSet`] and returning [`TaskHandle`]. It is DataFusion-owned and is not
+/// an external executor plugin point. Runtimes that support `!Send` local tasks
+/// need separate abstractions; this trait is not a `!Send` local runtime
+/// abstraction.
+pub trait JoinSetSpawner: private::Sealed {
+    /// Spawn an asynchronous task into an existing join set.
+    fn spawn_join_set<T, R>(&self, join_set: &mut JoinSet<R>, task: T) -> TaskHandle
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static;
+
+    /// Spawn a blocking task into an existing join set.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    fn spawn_blocking_join_set<T, R>(
+        &self,
+        join_set: &mut JoinSet<R>,
+        task: T,
+    ) -> TaskHandle
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static;
+}
+
+impl JoinSetSpawner for RuntimeHandle {
+    fn spawn_join_set<T, R>(&self, join_set: &mut JoinSet<R>, task: T) -> TaskHandle
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        join_set.spawn_task_on_runtime(task, self)
+    }
+
+    fn spawn_blocking_join_set<T, R>(
+        &self,
+        join_set: &mut JoinSet<R>,
+        task: T,
+    ) -> TaskHandle
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        join_set.spawn_blocking_task_on_runtime(task, self)
+    }
+}
 
 /// Helper that  provides a simple API to spawn a single task and join it.
 /// Provides guarantees of aborting on `Drop` to keep it cancel-safe.
@@ -31,10 +145,20 @@ use crate::trace_utils::{trace_block, trace_future};
 /// aborted if it hasn't started yet.
 ///
 /// Technically, it's just a wrapper of a `JoinHandle` overriding drop.
-#[derive(Debug)]
 pub struct SpawnedTask<R> {
-    inner: JoinHandle<R>,
+    inner: Pin<Box<dyn Future<Output = Result<R, JoinError>> + Send + 'static>>,
+    abort: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+impl<R> Debug for SpawnedTask<R> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnedTask").finish_non_exhaustive()
+    }
+}
+
+// `SpawnedTask` only exposes polling through `Pin<&mut Self>` and cancellation
+// through `Drop`, so shared references cannot concurrently poll the inner future.
+unsafe impl<R: Send> Sync for SpawnedTask<R> {}
 
 impl<R: 'static> SpawnedTask<R> {
     pub fn spawn<T>(task: T) -> Self
@@ -46,7 +170,11 @@ impl<R: 'static> SpawnedTask<R> {
         // Ok to use spawn here as SpawnedTask handles aborting/cancelling the task on Drop
         #[expect(clippy::disallowed_methods)]
         let inner = tokio::task::spawn(trace_future(task));
-        Self { inner }
+        let abort = inner.abort_handle();
+        Self {
+            inner: Box::pin(async move { inner.await.map_err(JoinError::from_tokio) }),
+            abort: Some(Arc::new(move || abort.abort())),
+        }
     }
 
     pub fn spawn_blocking<T>(task: T) -> Self
@@ -58,7 +186,107 @@ impl<R: 'static> SpawnedTask<R> {
         // Ok to use spawn_blocking here as SpawnedTask handles aborting/cancelling the task on Drop
         #[expect(clippy::disallowed_methods)]
         let inner = tokio::task::spawn_blocking(trace_block(task));
-        Self { inner }
+        let abort = inner.abort_handle();
+        Self {
+            inner: Box::pin(async move { inner.await.map_err(JoinError::from_tokio) }),
+            abort: Some(Arc::new(move || abort.abort())),
+        }
+    }
+
+    /// Spawn a task on a provided DataFusion runtime handle.
+    pub fn spawn_on_runtime<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send,
+    {
+        if handle.is_tokio() {
+            let inner = handle.as_tokio().spawn(trace_future(task));
+            let abort = inner.abort_handle();
+            Self {
+                inner: Box::pin(
+                    async move { inner.await.map_err(JoinError::from_tokio) },
+                ),
+                abort: Some(Arc::new(move || abort.abort())),
+            }
+        } else {
+            Self::spawn_on_spawner(task, handle)
+        }
+    }
+
+    /// Spawn a blocking task on a provided DataFusion runtime handle.
+    ///
+    /// Aborting the task may only prevent it from starting. Once the blocking
+    /// task is running, it may continue to run to completion.
+    pub fn spawn_blocking_on_runtime<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send,
+    {
+        if handle.is_tokio() {
+            let inner = handle.as_tokio().spawn_blocking(trace_block(task));
+            let abort = inner.abort_handle();
+            Self {
+                inner: Box::pin(
+                    async move { inner.await.map_err(JoinError::from_tokio) },
+                ),
+                abort: Some(Arc::new(move || abort.abort())),
+            }
+        } else {
+            Self::spawn_blocking_on_spawner(task, handle)
+        }
+    }
+
+    fn spawn_on_spawner<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: Future<Output = R>,
+        T: Send + 'static,
+        R: Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        let spawn_handle = handle.spawner().spawn(
+            async move {
+                let _ = tx.send(trace_future(task).await);
+            }
+            .boxed(),
+        );
+        Self::from_spawn_handle(rx, spawn_handle)
+    }
+
+    fn spawn_blocking_on_spawner<T>(task: T, handle: &RuntimeHandle) -> Self
+    where
+        T: FnOnce() -> R,
+        T: Send + 'static,
+        R: Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        let spawn_handle = handle.spawner().spawn_blocking(Box::new(move || {
+            let _ = tx.send(trace_block(task)());
+        }));
+        Self::from_spawn_handle(rx, spawn_handle)
+    }
+
+    fn from_spawn_handle(rx: oneshot::Receiver<R>, spawn_handle: SpawnHandle) -> Self
+    where
+        R: Send,
+    {
+        let abort = Arc::new({
+            let spawn_handle = spawn_handle.abort_handle();
+            move || spawn_handle()
+        });
+        Self {
+            inner: Box::pin(async move {
+                match rx.await {
+                    Ok(value) => Ok(value),
+                    Err(_) => match spawn_handle.await {
+                        Ok(()) => Err(JoinError::cancelled()),
+                        Err(error) => Err(error),
+                    },
+                }
+            }),
+            abort: Some(abort),
+        }
     }
 
     /// Joins the task, returning the result of join (`Result<R, JoinError>`).
@@ -101,13 +329,15 @@ impl<R> Future for SpawnedTask<R> {
     type Output = Result<R, JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        self.inner.as_mut().poll(cx)
     }
 }
 
 impl<R> Drop for SpawnedTask<R> {
     fn drop(&mut self) {
-        self.inner.abort();
+        if let Some(abort) = self.abort.take() {
+            abort();
+        }
     }
 }
 
@@ -185,5 +415,83 @@ mod tests {
 
         // The sender was dropped so we receive `None`.
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[test]
+    fn spawn_on_runtime_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = SpawnedTask::spawn_on_runtime(async { 42 }, &handle);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn spawn_blocking_on_runtime_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = SpawnedTask::spawn_blocking_on_runtime(|| 42, &handle);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn task_spawner_spawn_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = TaskSpawner::spawn(&handle, async { 42 });
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn task_spawner_spawn_blocking_uses_provided_runtime() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+
+        let task = TaskSpawner::spawn_blocking(&handle, || 42);
+
+        assert_eq!(rt.block_on(task.join()).unwrap(), 42);
+    }
+
+    #[test]
+    fn join_set_spawner_spawn_joins_with_task_id() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+        let mut join_set = JoinSet::new();
+
+        let task_handle =
+            JoinSetSpawner::spawn_join_set(&handle, &mut join_set, async { 42 });
+        let expected_id = task_handle.id();
+
+        let (task_id, value) = rt
+            .block_on(join_set.join_next_with_task_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_id, expected_id);
+        assert_eq!(value, 42);
+        assert!(task_handle.is_finished());
+    }
+
+    #[test]
+    fn join_set_spawner_spawn_blocking_joins_with_task_id() {
+        let rt = Runtime::new().unwrap();
+        let handle = RuntimeHandle::from_tokio(rt.handle().clone());
+        let mut join_set = JoinSet::new();
+
+        let task_handle =
+            JoinSetSpawner::spawn_blocking_join_set(&handle, &mut join_set, || 42);
+        let expected_id = task_handle.id();
+
+        let (task_id, value) = rt
+            .block_on(join_set.join_next_with_task_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_id, expected_id);
+        assert_eq!(value, 42);
+        assert!(task_handle.is_finished());
     }
 }

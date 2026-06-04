@@ -18,6 +18,7 @@
 use async_trait::async_trait;
 use datafusion_common::config::{ConfigOptions, TableOptions};
 use datafusion_common::{DFSchema, Result};
+use datafusion_common_runtime::RuntimeHandle;
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -128,6 +129,11 @@ pub trait Session: Send + Sync {
     /// Return the runtime env
     fn runtime_env(&self) -> &Arc<RuntimeEnv>;
 
+    /// Return the runtime handle used to spawn execution tasks, if configured.
+    fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        None
+    }
+
     /// Return the execution properties
     fn execution_props(&self) -> &ExecutionProps;
 
@@ -153,7 +159,7 @@ pub trait Session: Send + Sync {
 impl From<&dyn Session> for TaskContext {
     fn from(state: &dyn Session) -> Self {
         let task_id = None;
-        TaskContext::new(
+        TaskContext::new_with_runtime_handle(
             task_id,
             state.session_id().to_string(),
             state.config().clone(),
@@ -162,6 +168,10 @@ impl From<&dyn Session> for TaskContext {
             state.aggregate_functions().clone(),
             state.window_functions().clone(),
             Arc::clone(state.runtime_env()),
+            state
+                .runtime_handle()
+                .cloned()
+                .or_else(|| RuntimeHandle::try_current().ok()),
         )
     }
 }

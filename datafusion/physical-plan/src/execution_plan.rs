@@ -54,14 +54,13 @@ use datafusion_common::{
     Constraints, DataFusionError, Result, assert_eq_or_internal_err,
     assert_or_internal_err, exec_err,
 };
-use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, OrderingRequirements, PhysicalSortExpr,
 };
 
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 
 /// Represent nodes in the DataFusion Physical Plan.
 ///
@@ -1298,31 +1297,18 @@ pub async fn collect_partitioned(
 ) -> Result<Vec<Vec<RecordBatch>>> {
     let streams = execute_stream_partitioned(plan, context)?;
 
-    let mut join_set = JoinSet::new();
-    // Execute the plan and collect the results into batches.
-    streams.into_iter().enumerate().for_each(|(idx, stream)| {
-        join_set.spawn(async move {
+    let mut tasks = streams
+        .into_iter()
+        .enumerate()
+        .map(|(idx, stream)| async move {
             let result: Result<Vec<RecordBatch>> = stream.try_collect().await;
             (idx, result)
-        });
-    });
+        })
+        .collect::<FuturesUnordered<_>>();
 
     let mut batches = vec![];
-    // Note that currently this doesn't identify the thread that panicked
-    //
-    // TODO: Replace with [join_next_with_id](https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html#method.join_next_with_id
-    // once it is stable
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok((idx, res)) => batches.push((idx, res?)),
-            Err(e) => {
-                if e.is_panic() {
-                    std::panic::resume_unwind(e.into_panic());
-                } else {
-                    unreachable!();
-                }
-            }
-        }
+    while let Some((idx, res)) = tasks.next().await {
+        batches.push((idx, res?));
     }
 
     batches.sort_by_key(|(idx, _)| *idx);

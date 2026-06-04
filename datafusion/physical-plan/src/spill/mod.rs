@@ -52,7 +52,7 @@ use arrow_ipc::CompressionType;
 
 use datafusion_common::config::SpillCompression;
 use datafusion_common::{DataFusionError, Result, exec_datafusion_err, exec_err};
-use datafusion_common_runtime::SpawnedTask;
+use datafusion_common_runtime::{RuntimeHandle, SpawnedTask};
 use datafusion_execution::RecordBatchStream;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use futures::{FutureExt as _, Stream};
@@ -73,6 +73,7 @@ struct SpillReaderStream {
     /// For context on why this value is recorded and validated,
     /// see `physical_plan/sort/multi_level_merge.rs`.
     max_record_batch_memory: Option<usize>,
+    runtime_handle: Option<RuntimeHandle>,
 }
 
 // Small margin allowed to accommodate slight memory accounting variation
@@ -102,12 +103,25 @@ impl SpillReaderStream {
         schema: SchemaRef,
         spill_file: RefCountedTempFile,
         max_record_batch_memory: Option<usize>,
+        runtime_handle: Option<RuntimeHandle>,
     ) -> Self {
         Self {
             schema,
             state: SpillReaderStreamState::Uninitialized(spill_file),
             max_record_batch_memory,
+            runtime_handle,
         }
+    }
+
+    fn runtime_handle(&self) -> Result<RuntimeHandle> {
+        self.runtime_handle
+            .clone()
+            .or_else(|| RuntimeHandle::try_current().ok())
+            .ok_or_else(|| {
+                exec_datafusion_err!(
+                    "SpillReaderStream requires a runtime handle to spawn blocking read tasks"
+                )
+            })
     }
 
     fn poll_next_inner(
@@ -124,34 +138,41 @@ impl SpillReaderStream {
                 };
 
                 let expected_schema = Arc::clone(&self.schema);
-                let task = SpawnedTask::spawn_blocking(move || {
-                    let file = BufReader::new(File::open(spill_file.path())?);
-                    // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
-                    // with validated schemas and buffers. Skip redundant validation during read
-                    // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
-                    let mut reader = unsafe {
-                        StreamReader::try_new(file, None)?.with_skip_validation(true)
-                    };
+                let runtime_handle = match self.runtime_handle() {
+                    Ok(runtime_handle) => runtime_handle,
+                    Err(error) => return Poll::Ready(Some(Err(error))),
+                };
+                let task = SpawnedTask::spawn_blocking_on_runtime(
+                    move || {
+                        let file = BufReader::new(File::open(spill_file.path())?);
+                        // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
+                        // with validated schemas and buffers. Skip redundant validation during read
+                        // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
+                        let mut reader = unsafe {
+                            StreamReader::try_new(file, None)?.with_skip_validation(true)
+                        };
 
-                    // Validate the schema read from Arrow IPC file is the same as the
-                    // schema of the current `SpillManager`
-                    let actual_schema = reader.schema();
+                        // Validate the schema read from Arrow IPC file is the same as the
+                        // schema of the current `SpillManager`
+                        let actual_schema = reader.schema();
 
-                    if actual_schema != expected_schema {
-                        return exec_err!(
-                            "Spill file schema mismatch: expected {}, got {}. \
+                        if actual_schema != expected_schema {
+                            return exec_err!(
+                                "Spill file schema mismatch: expected {}, got {}. \
                             The caller must use the same SpillManager that created the spill file to read it.",
-                            expected_schema,
-                            actual_schema
-                        );
-                    }
+                                expected_schema,
+                                actual_schema
+                            );
+                        }
 
-                    // TODO: Same-schema reads from a different SpillManager still pass today.
-                    // Add a SpillManager UID to IPC metadata and validate it here as well.
-                    let next_batch = reader.next().transpose()?;
+                        // TODO: Same-schema reads from a different SpillManager still pass today.
+                        // Add a SpillManager UID to IPC metadata and validate it here as well.
+                        let next_batch = reader.next().transpose()?;
 
-                    Ok((reader, next_batch))
-                });
+                        Ok((reader, next_batch))
+                    },
+                    &runtime_handle,
+                );
 
                 self.state = SpillReaderStreamState::ReadInProgress(task);
 
@@ -213,11 +234,18 @@ impl SpillReaderStream {
                     unreachable!()
                 };
 
-                let task = SpawnedTask::spawn_blocking(move || {
-                    let next_batch = reader.next().transpose()?;
+                let runtime_handle = match self.runtime_handle() {
+                    Ok(runtime_handle) => runtime_handle,
+                    Err(error) => return Poll::Ready(Some(Err(error))),
+                };
+                let task = SpawnedTask::spawn_blocking_on_runtime(
+                    move || {
+                        let next_batch = reader.next().transpose()?;
 
-                    Ok((reader, next_batch))
-                });
+                        Ok((reader, next_batch))
+                    },
+                    &runtime_handle,
+                );
 
                 self.state = SpillReaderStreamState::ReadInProgress(task);
 
@@ -559,8 +587,57 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::compute::cast;
     use arrow::datatypes::{DataType, Field};
+    use datafusion_common_runtime::{RuntimeHandle, RuntimeSpawner, SpawnHandle};
     use datafusion_execution::runtime_env::RuntimeEnv;
+    use futures::FutureExt;
     use futures::StreamExt as _;
+    use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        blocking_spawns: AtomicUsize,
+    }
+
+    impl RuntimeSpawner for RecordingRuntime {
+        fn spawn(&self, fut: BoxFuture<'static, ()>) -> SpawnHandle {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                futures::executor::block_on(fut);
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+
+        fn spawn_blocking(
+            &self,
+            task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> SpawnHandle {
+            self.blocking_spawns.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                task();
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+    }
 
     #[tokio::test]
     async fn test_batch_spill_and_read() -> Result<()> {
@@ -596,6 +673,35 @@ mod tests {
 
         let batches = collect(stream).await?;
         assert_eq!(batches.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn spill_read_uses_supplied_non_tokio_runtime() -> Result<()> {
+        let batch = build_table_i32(
+            ("a2", &vec![0, 1, 2]),
+            ("b2", &vec![3, 4, 5]),
+            ("c2", &vec![4, 5, 6]),
+        );
+        let schema = batch.schema();
+        let recording_runtime = Arc::new(RecordingRuntime::default());
+        let spawner: Arc<dyn RuntimeSpawner> = Arc::clone(&recording_runtime) as _;
+        let runtime_handle = RuntimeHandle::from_spawner(spawner);
+
+        let env = Arc::new(RuntimeEnv::default());
+        let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&schema))
+            .with_runtime_handle(Some(runtime_handle));
+
+        let spill_file = spill_manager
+            .spill_record_batch_and_finish(&[batch], "Test")?
+            .unwrap();
+        let stream = spill_manager.read_spill_as_stream_unbuffered(spill_file, None)?;
+        let batches = futures::executor::block_on(collect(stream))?;
+
+        assert_eq!(batches.len(), 1);
+        assert!(recording_runtime.blocking_spawns.load(Ordering::SeqCst) > 0);
 
         Ok(())
     }
