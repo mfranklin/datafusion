@@ -30,13 +30,14 @@ use crate::displayable;
 use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion_common::{Result, exec_err};
-use datafusion_common_runtime::{JoinSet, JoinSetSpawner, RuntimeHandle};
+use datafusion_common::{Result, exec_err, internal_datafusion_err};
+use datafusion_common_runtime::{RuntimeHandle, SpawnedTask, TaskSpawner};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
 
 use futures::ready;
 use futures::stream::BoxStream;
+use futures::stream::FuturesUnordered;
 use futures::{Future, Stream, StreamExt};
 use log::debug;
 use pin_project_lite::pin_project;
@@ -57,7 +58,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 pub(crate) struct ReceiverStreamBuilder<O> {
     tx: Sender<Result<O>>,
     rx: Receiver<Result<O>>,
-    join_set: JoinSet<Result<()>>,
+    tasks: Vec<SpawnedTask<Result<()>>>,
 }
 
 impl<O: Send + 'static> ReceiverStreamBuilder<O> {
@@ -68,7 +69,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         Self {
             tx,
             rx,
-            join_set: JoinSet::new(),
+            tasks: vec![],
         }
     }
 
@@ -84,7 +85,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
-        self.join_set.spawn_task(task);
+        self.tasks.push(SpawnedTask::spawn(task));
     }
 
     /// Same as [`Self::spawn`] but it spawns the task on the provided Tokio runtime handle.
@@ -93,7 +94,8 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: Future<Output = Result<()>>,
         F: Send + 'static,
     {
-        self.join_set.spawn_task_on(task, handle);
+        let runtime = RuntimeHandle::from_tokio(handle.clone());
+        self.spawn_with(task, &runtime);
     }
 
     /// Same as [`Self::spawn`] but it spawns the task using the provided spawner.
@@ -101,9 +103,9 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
     where
         F: Future<Output = Result<()>>,
         F: Send + 'static,
-        S: JoinSetSpawner,
+        S: TaskSpawner,
     {
-        spawner.spawn_join_set(&mut self.join_set, task);
+        self.tasks.push(spawner.spawn(task));
     }
 
     /// Spawn a blocking task tied to the builder and stream.
@@ -119,7 +121,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking_task(f);
+        self.tasks.push(SpawnedTask::spawn_blocking(f));
     }
 
     /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided Tokio runtime handle.
@@ -128,7 +130,8 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking_task_on(f, handle);
+        let runtime = RuntimeHandle::from_tokio(handle.clone());
+        self.spawn_blocking_with(f, &runtime);
     }
 
     /// Same as [`Self::spawn_blocking`] but it spawns the blocking task using
@@ -140,25 +143,22 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
     where
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
-        S: JoinSetSpawner,
+        S: TaskSpawner,
     {
-        spawner.spawn_blocking_join_set(&mut self.join_set, f);
+        self.tasks.push(spawner.spawn_blocking(f));
     }
 
     /// Create a stream of all data written to `tx`
     pub fn build(self) -> BoxStream<'static, Result<O>> {
-        let Self {
-            tx,
-            rx,
-            mut join_set,
-        } = self;
+        let Self { tx, rx, tasks } = self;
 
         // Doesn't need tx
         drop(tx);
 
         // future that checks the result of the join set, and propagates panic if seen
         let check = async move {
-            while let Some(result) = join_set.join_next().await {
+            let mut tasks = tasks.into_iter().collect::<FuturesUnordered<_>>();
+            while let Some(result) = tasks.next().await {
                 match result {
                     Ok(task_result) => {
                         match task_result {
@@ -168,7 +168,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
                             Err(error) => return Some(Err(error)),
                         }
                     }
-                    // This means a tokio task error, likely a panic
+                    // This means a task join error, likely a panic
                     Err(e) => {
                         if e.is_panic() {
                             // resume on the main thread
@@ -323,7 +323,7 @@ impl RecordBatchReceiverStreamBuilder {
     where
         F: Future<Output = Result<()>>,
         F: Send + 'static,
-        S: JoinSetSpawner,
+        S: TaskSpawner,
     {
         self.inner.spawn_with(task, spawner)
     }
@@ -382,7 +382,7 @@ impl RecordBatchReceiverStreamBuilder {
     where
         F: FnOnce() -> Result<()>,
         F: Send + 'static,
-        S: JoinSetSpawner,
+        S: TaskSpawner,
     {
         self.inner.spawn_blocking_with(f, spawner)
     }
@@ -399,21 +399,25 @@ impl RecordBatchReceiverStreamBuilder {
         context: Arc<TaskContext>,
     ) {
         let output = self.tx();
+        let error_output = output.clone();
         let input_display = if log::log_enabled!(log::Level::Debug) {
             displayable(input.as_ref()).one_line().to_string()
         } else {
             String::new()
         };
 
-        self.inner.spawn(async move {
+        let runtime_handle = context
+            .runtime_handle()
+            .cloned()
+            .or_else(|| RuntimeHandle::try_current().ok());
+
+        let task = async move {
             let mut stream = match input.execute(partition, context) {
                 Err(e) => {
                     // If send fails, the plan being torn down, there
                     // is no place to send the error and no reason to continue.
                     output.send(Err(e)).await.ok();
-                    debug!(
-                        "Stopping execution: error executing input: {input_display}",
-                    );
+                    debug!("Stopping execution: error executing input: {input_display}",);
                     return Ok(());
                 }
                 Ok(stream) => stream,
@@ -447,7 +451,18 @@ impl RecordBatchReceiverStreamBuilder {
             }
 
             Ok(())
-        });
+        };
+
+        match runtime_handle {
+            Some(runtime_handle) => self.inner.spawn_with(task, &runtime_handle),
+            None => {
+                error_output
+                    .try_send(Err(internal_datafusion_err!(
+                        "RecordBatchReceiverStreamBuilder requires a runtime handle to spawn input tasks"
+                    )))
+                    .ok();
+            }
+        }
     }
 
     /// Create a stream of all [`RecordBatch`] written to `tx`
@@ -891,6 +906,67 @@ mod test {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::exec_err;
+    use datafusion_common_runtime::{RuntimeSpawner, SpawnHandle};
+    use futures::FutureExt;
+    use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        async_spawns: AtomicUsize,
+        blocking_spawns: AtomicUsize,
+    }
+
+    impl RecordingRuntime {
+        fn async_spawns(&self) -> usize {
+            self.async_spawns.load(Ordering::SeqCst)
+        }
+
+        fn blocking_spawns(&self) -> usize {
+            self.blocking_spawns.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RuntimeSpawner for RecordingRuntime {
+        fn spawn(&self, fut: BoxFuture<'static, ()>) -> SpawnHandle {
+            self.async_spawns.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                futures::executor::block_on(fut);
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+
+        fn spawn_blocking(
+            &self,
+            task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> SpawnHandle {
+            self.blocking_spawns.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                task();
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+    }
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, true)]))
@@ -1153,6 +1229,53 @@ mod test {
             number_of_batches, 2,
             "Should have received exactly two empty batches"
         );
+    }
+
+    #[test]
+    fn record_batch_receiver_stream_builder_uses_supplied_non_tokio_runtime() {
+        let recording_runtime = Arc::new(RecordingRuntime::default());
+        let spawner: Arc<dyn RuntimeSpawner> = Arc::clone(&recording_runtime) as _;
+        let runtime_handle = RuntimeHandle::from_spawner(spawner);
+
+        let mut builder =
+            RecordBatchReceiverStreamBuilder::new(Arc::new(Schema::empty()), 10);
+
+        let tx1 = builder.tx();
+        builder.spawn_on_runtime(
+            async move {
+                tx1.send(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
+                    .await
+                    .unwrap();
+
+                Ok(())
+            },
+            &runtime_handle,
+        );
+
+        let tx2 = builder.tx();
+        builder.spawn_blocking_on_runtime(
+            move || {
+                tx2.blocking_send(Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
+                    .unwrap();
+
+                Ok(())
+            },
+            &runtime_handle,
+        );
+
+        let batches = futures::executor::block_on(async move {
+            let mut stream = builder.build();
+            let mut batches = 0;
+            while let Some(batch) = stream.next().await.transpose().unwrap() {
+                batches += 1;
+                assert_eq!(batch.num_rows(), 0);
+            }
+            batches
+        });
+
+        assert_eq!(batches, 2);
+        assert_eq!(recording_runtime.async_spawns(), 1);
+        assert_eq!(recording_runtime.blocking_spawns(), 1);
     }
 
     #[tokio::test]

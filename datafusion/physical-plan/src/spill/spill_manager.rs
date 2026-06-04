@@ -193,6 +193,7 @@ impl SpillManager {
             Arc::clone(&self.schema),
             spill_file_path,
             max_record_batch_memory,
+            self.runtime_handle.clone(),
         ))) as SendableRecordBatchStream;
 
         Ok(match &self.runtime_handle {
@@ -215,6 +216,7 @@ impl SpillManager {
             Arc::clone(&self.schema),
             spill_file_path,
             max_record_batch_memory,
+            self.runtime_handle.clone(),
         ))))
     }
 }

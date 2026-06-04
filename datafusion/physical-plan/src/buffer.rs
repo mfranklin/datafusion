@@ -31,8 +31,10 @@ use crate::{
 };
 use arrow::array::RecordBatch;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{Result, Statistics, internal_err, plan_err};
-use datafusion_common_runtime::SpawnedTask;
+use datafusion_common::{
+    Result, Statistics, internal_datafusion_err, internal_err, plan_err,
+};
+use datafusion_common_runtime::{RuntimeHandle, SpawnedTask};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr_common::metrics::{
@@ -185,6 +187,15 @@ impl ExecutionPlan for BufferExec {
     ) -> Result<SendableRecordBatchStream> {
         let mem_reservation = MemoryConsumer::new(format!("BufferExec[{partition}]"))
             .register(context.memory_pool());
+        let runtime_handle = context
+            .runtime_handle()
+            .cloned()
+            .or_else(|| RuntimeHandle::try_current().ok())
+            .ok_or_else(|| {
+                internal_datafusion_err!(
+                    "BufferExec requires a runtime handle to spawn the buffered producer task"
+                )
+            })?;
         let in_stream = self.input.execute(partition, context)?;
 
         // Set up the metrics for the stream.
@@ -218,8 +229,12 @@ impl ExecutionPlan for BufferExec {
             }
         });
         // Buffer the input.
-        let out_stream =
-            MemoryBufferedStream::new(in_stream, self.capacity, mem_reservation);
+        let out_stream = MemoryBufferedStream::new_on_runtime(
+            in_stream,
+            self.capacity,
+            mem_reservation,
+            &runtime_handle,
+        );
         // Update in the metrics that when an element gets out, some memory gets freed.
         let out_stream = out_stream.inspect_ok(move |v| {
             curr_mem_out.fetch_sub(v.get_array_memory_size(), Ordering::Relaxed);
@@ -318,16 +333,37 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
     ///
     /// This immediately spawns a Tokio task that will start consumption of the input stream.
     pub fn new(
+        input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
+        capacity: usize,
+        memory_reservation: MemoryReservation,
+    ) -> Self {
+        Self::new_with_task(input, capacity, memory_reservation, SpawnedTask::spawn)
+    }
+
+    /// Builds a new [MemoryBufferedStream] using the provided runtime handle.
+    pub fn new_on_runtime(
+        input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
+        capacity: usize,
+        memory_reservation: MemoryReservation,
+        runtime_handle: &RuntimeHandle,
+    ) -> Self {
+        Self::new_with_task(input, capacity, memory_reservation, |task| {
+            SpawnedTask::spawn_on_runtime(task, runtime_handle)
+        })
+    }
+
+    fn new_with_task(
         mut input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
         capacity: usize,
         memory_reservation: MemoryReservation,
+        spawn: impl FnOnce(futures::future::BoxFuture<'static, ()>) -> SpawnedTask<()>,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(capacity));
         let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let memory_reservation = Arc::new(memory_reservation);
         let memory_reservation_clone = Arc::clone(&memory_reservation);
-        let task = SpawnedTask::spawn(async move {
+        let task = spawn(Box::pin(async move {
             loop {
                 // Select on both the input stream and the channel being closed.
                 // By down this, we abort polling the input as soon as the consumer channel is
@@ -373,7 +409,7 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
                     break; // stream was closed
                 };
             }
-        });
+        }));
 
         Self {
             task,
@@ -421,10 +457,60 @@ mod tests {
     use datafusion_execution::memory_pool::{
         GreedyMemoryPool, MemoryPool, UnboundedMemoryPool,
     };
+    use futures::FutureExt;
+    use futures::future::BoxFuture;
     use std::error::Error;
     use std::fmt::Debug;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    use datafusion_common_runtime::{RuntimeSpawner, SpawnHandle};
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        async_spawns: AtomicUsize,
+    }
+
+    impl RuntimeSpawner for RecordingRuntime {
+        fn spawn(&self, fut: BoxFuture<'static, ()>) -> SpawnHandle {
+            self.async_spawns.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                futures::executor::block_on(fut);
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+
+        fn spawn_blocking(
+            &self,
+            task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> SpawnHandle {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                task();
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+    }
 
     #[tokio::test]
     async fn buffers_only_some_messages() -> Result<(), Box<dyn Error>> {
@@ -451,6 +537,30 @@ mod tests {
         pull_ok_msg(&mut buffered).await?;
         pull_ok_msg(&mut buffered).await?;
         finished(&mut buffered).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn uses_supplied_non_tokio_runtime() -> Result<(), Box<dyn Error>> {
+        let input = futures::stream::iter([1, 2, 3, 4]).map(Ok);
+        let (_, res) = memory_pool_and_reservation();
+        let recording_runtime = Arc::new(RecordingRuntime::default());
+        let spawner: Arc<dyn RuntimeSpawner> = Arc::clone(&recording_runtime) as _;
+        let runtime_handle = RuntimeHandle::from_spawner(spawner);
+
+        let mut buffered =
+            MemoryBufferedStream::new_on_runtime(input, 10, res, &runtime_handle);
+
+        let values = futures::executor::block_on(async move {
+            let mut values = vec![];
+            while let Some(value) = buffered.next().await.transpose()? {
+                values.push(value);
+            }
+            Result::<Vec<_>>::Ok(values)
+        })?;
+
+        assert_eq!(values, vec![1, 2, 3, 4]);
+        assert_eq!(recording_runtime.async_spawns.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

@@ -192,6 +192,8 @@ pub struct SessionState {
     table_factories: HashMap<String, Arc<dyn TableProviderFactory>>,
     /// Runtime environment
     runtime_env: Arc<RuntimeEnv>,
+    /// Runtime handle used to spawn execution tasks
+    runtime_handle: Option<RuntimeHandle>,
     /// [FunctionFactory] to support pluggable user defined function handler.
     ///
     /// It will be invoked on `CREATE FUNCTION` statements.
@@ -228,6 +230,7 @@ impl Debug for SessionState {
             .field("session_id", &self.session_id)
             .field("config", &self.config)
             .field("runtime_env", &self.runtime_env)
+            .field("runtime_handle", &self.runtime_handle)
             .field("catalog_list", &self.catalog_list)
             .field("serializer_registry", &self.serializer_registry)
             .field("file_formats", &self.file_formats)
@@ -305,6 +308,10 @@ impl Session for SessionState {
 
     fn runtime_env(&self) -> &Arc<RuntimeEnv> {
         self.runtime_env()
+    }
+
+    fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        self.runtime_handle()
     }
 
     fn execution_props(&self) -> &ExecutionProps {
@@ -812,6 +819,11 @@ impl SessionState {
         &self.runtime_env
     }
 
+    /// Return the runtime handle used to spawn execution tasks, if configured.
+    pub fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        self.runtime_handle.as_ref()
+    }
+
     /// Return the execution properties
     pub fn execution_props(&self) -> &ExecutionProps {
         &self.execution_props
@@ -1048,6 +1060,7 @@ pub struct SessionStateBuilder {
     execution_props: Option<ExecutionProps>,
     table_factories: Option<HashMap<String, Arc<dyn TableProviderFactory>>>,
     runtime_env: Option<Arc<RuntimeEnv>>,
+    runtime_handle: Option<RuntimeHandle>,
     function_factory: Option<Arc<dyn FunctionFactory>>,
     cache_factory: Option<Arc<dyn CacheFactory>>,
     statistics_registry: Option<StatisticsRegistry>,
@@ -1091,6 +1104,7 @@ impl SessionStateBuilder {
             execution_props: None,
             table_factories: None,
             runtime_env: None,
+            runtime_handle: None,
             function_factory: None,
             cache_factory: None,
             statistics_registry: None,
@@ -1151,6 +1165,7 @@ impl SessionStateBuilder {
             execution_props: Some(existing.execution_props),
             table_factories: Some(existing.table_factories),
             runtime_env: Some(existing.runtime_env),
+            runtime_handle: existing.runtime_handle,
             function_factory: existing.function_factory,
             cache_factory: existing.cache_factory,
             statistics_registry: existing.statistics_registry,
@@ -1470,6 +1485,12 @@ impl SessionStateBuilder {
         self
     }
 
+    /// Set the runtime handle used to spawn execution tasks.
+    pub fn with_runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
+        self.runtime_handle = Some(runtime_handle);
+        self
+    }
+
     /// Set a [`FunctionFactory`] to handle `CREATE FUNCTION` statements
     pub fn with_function_factory(
         mut self,
@@ -1564,6 +1585,7 @@ impl SessionStateBuilder {
             execution_props,
             table_factories,
             runtime_env,
+            runtime_handle,
             function_factory,
             cache_factory,
             statistics_registry,
@@ -1606,6 +1628,7 @@ impl SessionStateBuilder {
             execution_props: execution_props.unwrap_or_default(),
             table_factories: table_factories.unwrap_or_default(),
             runtime_env,
+            runtime_handle,
             function_factory,
             cache_factory,
             statistics_registry,
@@ -1886,6 +1909,7 @@ impl Debug for SessionStateBuilder {
             .field("session_id", &self.session_id)
             .field("config", &self.config)
             .field("runtime_env", &self.runtime_env)
+            .field("runtime_handle", &self.runtime_handle)
             .field("catalog_list", &self.catalog_list)
             .field("serializer_registry", &self.serializer_registry)
             .field("file_formats", &self.file_formats)
@@ -2298,7 +2322,10 @@ impl From<&SessionState> for TaskContext {
             state.aggregate_functions.clone(),
             state.window_functions.clone(),
             Arc::clone(&state.runtime_env),
-            RuntimeHandle::try_current().ok(),
+            state
+                .runtime_handle()
+                .cloned()
+                .or_else(|| RuntimeHandle::try_current().ok()),
         )
     }
 }

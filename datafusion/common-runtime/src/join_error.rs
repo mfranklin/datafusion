@@ -30,27 +30,52 @@ use crate::join_set::TaskId;
 /// thread-affine runtimes will need separate abstractions.
 #[derive(Debug)]
 pub struct JoinError {
-    inner: tokio::task::JoinError,
+    inner: JoinErrorInner,
+}
+
+#[derive(Debug)]
+enum JoinErrorInner {
+    Tokio(tokio::task::JoinError),
+    Cancelled,
 }
 
 impl JoinError {
     pub(crate) fn from_tokio(inner: tokio::task::JoinError) -> Self {
-        Self { inner }
+        Self {
+            inner: JoinErrorInner::Tokio(inner),
+        }
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self {
+            inner: JoinErrorInner::Cancelled,
+        }
     }
 
     /// Returns true if the task was cancelled.
     pub fn is_cancelled(&self) -> bool {
-        self.inner.is_cancelled()
+        match &self.inner {
+            JoinErrorInner::Tokio(inner) => inner.is_cancelled(),
+            JoinErrorInner::Cancelled => true,
+        }
     }
 
     /// Returns true if the task panicked.
     pub fn is_panic(&self) -> bool {
-        self.inner.is_panic()
+        match &self.inner {
+            JoinErrorInner::Tokio(inner) => inner.is_panic(),
+            JoinErrorInner::Cancelled => false,
+        }
     }
 
     /// Returns an opaque identifier for the task that failed to join.
     pub fn id(&self) -> TaskId {
-        TaskId::from_tokio(self.inner.id())
+        match &self.inner {
+            JoinErrorInner::Tokio(inner) => TaskId::from_tokio(inner.id()),
+            JoinErrorInner::Cancelled => {
+                panic!("non-Tokio task cancellation does not have a Tokio task id")
+            }
+        }
     }
 
     /// Consumes the error and returns the panic payload.
@@ -59,24 +84,38 @@ impl JoinError {
     ///
     /// Panics if the joined task did not panic.
     pub fn into_panic(self) -> Box<dyn Any + Send + 'static> {
-        self.inner.into_panic()
+        match self.inner {
+            JoinErrorInner::Tokio(inner) => inner.into_panic(),
+            JoinErrorInner::Cancelled => panic!("task was cancelled, not panicked"),
+        }
     }
 
     /// Consumes the error and returns the panic payload, if the task panicked.
     pub fn try_into_panic(self) -> Result<Box<dyn Any + Send + 'static>, JoinError> {
-        self.inner.try_into_panic().map_err(JoinError::from_tokio)
+        match self.inner {
+            JoinErrorInner::Tokio(inner) => {
+                inner.try_into_panic().map_err(JoinError::from_tokio)
+            }
+            JoinErrorInner::Cancelled => Err(Self::cancelled()),
+        }
     }
 }
 
 impl Display for JoinError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.inner, f)
+        match &self.inner {
+            JoinErrorInner::Tokio(inner) => Display::fmt(inner, f),
+            JoinErrorInner::Cancelled => f.write_str("task was cancelled"),
+        }
     }
 }
 
 impl Error for JoinError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.inner)
+        match &self.inner {
+            JoinErrorInner::Tokio(inner) => Some(inner),
+            JoinErrorInner::Cancelled => None,
+        }
     }
 }
 

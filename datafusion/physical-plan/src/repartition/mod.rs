@@ -2004,6 +2004,8 @@ impl RecordBatchStream for PerPartitionStream {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::test::TestMemoryExec;
@@ -2024,11 +2026,66 @@ mod tests {
     use datafusion_common::cast::as_string_array;
     use datafusion_common::exec_err;
     use datafusion_common::test_util::batches_to_sort_string;
-    use datafusion_common_runtime::JoinSet;
+    use datafusion_common_runtime::{
+        JoinSet, RuntimeHandle, RuntimeSpawner, SpawnHandle,
+    };
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_physical_expr::{PhysicalSortExpr, RangePartitioning, SplitPoint};
+    use futures::FutureExt;
+    use futures::future::BoxFuture;
     use insta::assert_snapshot;
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        async_spawns: AtomicUsize,
+    }
+
+    impl RecordingRuntime {
+        fn async_spawns(&self) -> usize {
+            self.async_spawns.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RuntimeSpawner for RecordingRuntime {
+        fn spawn(&self, fut: BoxFuture<'static, ()>) -> SpawnHandle {
+            self.async_spawns.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                futures::executor::block_on(fut);
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+
+        fn spawn_blocking(
+            &self,
+            task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> SpawnHandle {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                task();
+                let _ = tx.send(());
+            });
+
+            SpawnHandle::new(
+                async move {
+                    let _ = rx.await;
+                    Ok(())
+                }
+                .boxed(),
+                || {},
+            )
+        }
+    }
 
     #[test]
     fn strength_reduced_u64_remainder_matches_modulo() {
@@ -2261,6 +2318,77 @@ mod tests {
             output_partitions.push(batches);
         }
         Ok(output_partitions)
+    }
+
+    #[test]
+    fn repartition_uses_supplied_non_tokio_runtime_outside_tokio() -> Result<()> {
+        let recording_runtime = Arc::new(RecordingRuntime::default());
+        let spawner: Arc<dyn RuntimeSpawner> = Arc::clone(&recording_runtime) as _;
+        let runtime_handle = RuntimeHandle::from_spawner(spawner);
+        let runtime = RuntimeEnvBuilder::default().build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_runtime(runtime)
+                .with_runtime_handle(runtime_handle),
+        );
+
+        let schema = test_schema();
+        let partition = create_vec_batches(2);
+        let input_partitions = vec![partition.clone(), partition];
+        let exec =
+            TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(exec, Partitioning::RoundRobinBatch(2))?;
+
+        let streams = (0..exec.partitioning().partition_count())
+            .map(|partition| exec.execute(partition, Arc::clone(&task_ctx)))
+            .collect::<Result<Vec<_>>>()?;
+
+        let row_counts = futures::executor::block_on(futures::future::try_join_all(
+            streams.into_iter().map(|mut stream| async move {
+                let mut rows = 0;
+                while let Some(batch) = stream.next().await.transpose()? {
+                    rows += batch.num_rows();
+                }
+                Result::<usize>::Ok(rows)
+            }),
+        ))?;
+
+        assert_eq!(row_counts.iter().sum::<usize>(), 2 * 2 * 8);
+        assert!(
+            recording_runtime.async_spawns() > 0,
+            "repartition should spawn through the supplied runtime"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn repartition_without_runtime_outside_tokio_returns_clear_error() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        assert!(task_ctx.runtime_handle().is_none());
+
+        let schema = test_schema();
+        let input_partitions = vec![create_vec_batches(1)];
+        let exec =
+            TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(exec, Partitioning::RoundRobinBatch(2))?;
+
+        let mut stream = exec.execute(0, task_ctx)?;
+        let error = futures::executor::block_on(async move {
+            stream
+                .next()
+                .await
+                .expect("stream should produce the runtime error")
+                .unwrap_err()
+        });
+        assert!(
+            error.to_string().contains(
+                "RepartitionExec requires a runtime handle to spawn input tasks"
+            ),
+            "unexpected error: {error}"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

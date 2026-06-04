@@ -34,7 +34,7 @@ mod trace_utils;
 pub use common::{JoinSetSpawner, SpawnedTask, TaskSpawner};
 pub use join_error::JoinError;
 pub use join_set::{JoinSet, TaskHandle, TaskId};
-pub use runtime::{RuntimeHandle, TryCurrentRuntimeError};
+pub use runtime::{RuntimeHandle, RuntimeSpawner, SpawnHandle, TryCurrentRuntimeError};
 pub use trace_utils::{
     JoinSetTracer, JoinSetTracerError, set_join_set_tracer, trace_block, trace_future,
 };

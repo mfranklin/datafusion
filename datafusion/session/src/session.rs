@@ -129,6 +129,11 @@ pub trait Session: Send + Sync {
     /// Return the runtime env
     fn runtime_env(&self) -> &Arc<RuntimeEnv>;
 
+    /// Return the runtime handle used to spawn execution tasks, if configured.
+    fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        None
+    }
+
     /// Return the execution properties
     fn execution_props(&self) -> &ExecutionProps;
 
@@ -163,7 +168,10 @@ impl From<&dyn Session> for TaskContext {
             state.aggregate_functions().clone(),
             state.window_functions().clone(),
             Arc::clone(state.runtime_env()),
-            RuntimeHandle::try_current().ok(),
+            state
+                .runtime_handle()
+                .cloned()
+                .or_else(|| RuntimeHandle::try_current().ok()),
         )
     }
 }
